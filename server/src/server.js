@@ -3,22 +3,31 @@ const cors = require("cors");
 require("dotenv").config();
 
 const pool = require("./config/db");
+const initAssignmentIntegrity = require("./config/initTrigger");
+initAssignmentIntegrity();
 
 const authRoutes = require("./routes/authRoutes");
 const vehicleRoutes = require("./routes/vehicleRoutes");
 const routeRoutes = require("./routes/routeRoutes");
 const gpsRoutes = require("./routes/gpsRoutes");
 const adminRoutes = require("./routes/adminRoutes");
+const collectionPointRoutes = require("./routes/collectionPointRoutes");
+const complaintRoutes = require("./routes/complaintRoutes");
+const citizenRoutes = require("./routes/citizenRoutes");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
+
 app.use("/api/auth", authRoutes);
 app.use("/api/vehicles", vehicleRoutes);
 app.use("/api/routes", routeRoutes);
 app.use("/api/gps", gpsRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/collection-points", collectionPointRoutes);
+app.use("/api/complaints", complaintRoutes);
+app.use("/api/citizen", citizenRoutes);
 
 app.get("/", (req, res) => {
     res.json({

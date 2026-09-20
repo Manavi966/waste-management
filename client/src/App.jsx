@@ -1,49 +1,64 @@
 import { useState } from "react";
-
+import LandingPage from "./pages/LandingPage";
 import Login from "./pages/Login";
 import CitizenDashboard from "./dashboards/CitizenDashboard";
 import DriverDashboard from "./dashboards/DriverDashboard";
 import AuthorityDashboard from "./dashboards/AuthorityDashboard";
 
 function App() {
-    const [isLoggedIn, setIsLoggedIn] = useState(
-        !!localStorage.getItem("token")
-    );
+    const [user, setUser] = useState(() => {
+        const stored = localStorage.getItem("user");
+        return stored ? JSON.parse(stored) : null;
+    });
+    const [view, setView] = useState(() => {
+        return localStorage.getItem("token") ? "DASHBOARD" : "LANDING";
+    });
+    const [selectedRole, setSelectedRole] = useState("AUTHORITY");
 
-    if (!isLoggedIn) {
-        return (
-            <Login
-                onLogin={() => setIsLoggedIn(true)}
-            />
-        );
-    }
+    const handleLoginSuccess = (userData) => {
+        setUser(userData);
+        setView("DASHBOARD");
+    };
 
-    const storedUser = localStorage.getItem("user");
-
-    if (!storedUser) {
+    const handleLogout = () => {
         localStorage.removeItem("token");
+        localStorage.removeItem("user");
+        setUser(null);
+        setView("LANDING");
+    };
+
+    const handleSelectRoleFromLanding = (role) => {
+        setSelectedRole(role);
+        setView("LOGIN");
+    };
+
+    if (view === "LANDING" && !user) {
+        return <LandingPage onSelectRole={handleSelectRoleFromLanding} />;
+    }
+
+    if ((view === "LOGIN" || !user)) {
         return (
             <Login
-                onLogin={() => setIsLoggedIn(true)}
+                initialRole={selectedRole}
+                onLogin={handleLoginSuccess}
+                onBackToLanding={() => setView("LANDING")}
             />
         );
     }
-
-    const user = JSON.parse(storedUser);
 
     if (user.role === "CITIZEN") {
-        return <CitizenDashboard user={user} />;
+        return <CitizenDashboard user={user} onLogout={handleLogout} />;
     }
 
     if (user.role === "DRIVER") {
-        return <DriverDashboard user={user} />;
+        return <DriverDashboard user={user} onLogout={handleLogout} />;
     }
 
     if (user.role === "AUTHORITY") {
-        return <AuthorityDashboard user={user} />;
+        return <AuthorityDashboard user={user} onLogout={handleLogout} />;
     }
 
-    return <Login onLogin={() => setIsLoggedIn(true)} />;
+    return <LandingPage onSelectRole={handleSelectRoleFromLanding} />;
 }
 
 export default App;
