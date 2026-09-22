@@ -13,6 +13,29 @@ L.Icon.Default.mergeOptions({
     shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png"
 });
 
+// Haversine distance in meters calculation
+function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
+    if (lat1 === undefined || lon1 === undefined || lat2 === undefined || lon2 === undefined) return null;
+    const R = 6371000; // Earth's radius in meters
+    const dLat = (lat2 - lat1) * (Math.PI / 180);
+    const dLon = (lon2 - lon1) * (Math.PI / 180);
+    const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+}
+
+// Format distance helper
+function formatDistance(meters) {
+    if (meters === null || meters === undefined) return "Calculating...";
+    if (meters < 1000) {
+        return `${Math.round(meters)} m`;
+    }
+    return `${(meters / 1000).toFixed(2)} km`;
+}
+
 // Map Controller for custom map buttons ("My Location" & "Fit Route")
 function MapController({ vehicleLocation, stops, actionTrigger }) {
     const map = useMap();
@@ -69,7 +92,7 @@ const createVehicleMarker = (vehicleNumber) => {
             gap: 6px;
             background: linear-gradient(135deg, #047857, #065f46);
             color: white;
-            padding: 5px 10px;
+            padding: 5px 12px;
             border-radius: 20px;
             font-weight: 800;
             font-size: 12px;
@@ -77,11 +100,11 @@ const createVehicleMarker = (vehicleNumber) => {
             box-shadow: 0 4px 10px rgba(0,0,0,0.35);
             white-space: nowrap;
         ">
-            <span style="font-size: 14px;">🚛</span>
+            <span style="font-size: 15px;">🚛</span>
             <span>You are here (${vehicleNumber || "Vehicle"})</span>
         </div>`,
-        iconSize: [170, 32],
-        iconAnchor: [85, 16],
+        iconSize: [180, 32],
+        iconAnchor: [90, 16],
         popupAnchor: [0, -16]
     });
 };
@@ -90,7 +113,9 @@ const createVehicleMarker = (vehicleNumber) => {
 const createStopPin = (sequence, status, isNext = false) => {
     let bgColor = "#f59e0b"; // Yellow/Amber for PENDING
     let iconSymbol = sequence;
-    let ringEffect = isNext ? "border: 3px solid #3b82f6; box-shadow: 0 0 0 4px rgba(59,130,246,0.4);" : "border: 2px solid white;";
+    let ringEffect = isNext
+        ? "border: 3px solid #38bdf8; box-shadow: 0 0 0 4px rgba(56,189,248,0.5); transform: scale(1.15);"
+        : "border: 2px solid white;";
 
     if (status === "COMPLETED") {
         bgColor = "#16a34a"; // Green
@@ -98,6 +123,9 @@ const createStopPin = (sequence, status, isNext = false) => {
     } else if (status === "MISSED") {
         bgColor = "#dc2626"; // Red
         iconSymbol = `✕ ${sequence}`;
+    } else if (isNext) {
+        bgColor = "#0284c7"; // Sky Blue / Star for Next Stop
+        iconSymbol = `⭐ ${sequence}`;
     }
 
     return L.divIcon({
@@ -117,10 +145,11 @@ const createStopPin = (sequence, status, isNext = false) => {
             ${ringEffect}
             box-shadow: 0 3px 6px rgba(0,0,0,0.35);
             white-space: nowrap;
+            transition: all 0.2s ease;
         ">${iconSymbol}</div>`,
-        iconSize: [40, 32],
-        iconAnchor: [20, 16],
-        popupAnchor: [0, -16]
+        iconSize: [44, 34],
+        iconAnchor: [22, 17],
+        popupAnchor: [0, -17]
     });
 };
 
@@ -131,6 +160,7 @@ function DriverDashboard({ user, onLogout }) {
     const [nextStop, setNextStop] = useState(null);
     const [summary, setSummary] = useState({ total_stops: 0, completed_count: 0, pending_count: 0, missed_count: 0, progress_percent: 0 });
     const [gps, setGps] = useState(null);
+    const [gpsAccuracy, setGpsAccuracy] = useState(null);
 
     const [selectedDate, setSelectedDate] = useState("2026-09-20");
     const [gpsTrackingActive, setGpsTrackingActive] = useState(false);
@@ -171,17 +201,27 @@ function DriverDashboard({ user, onLogout }) {
         fetchDriverRoute(selectedDate);
     }, [user.id, selectedDate]);
 
-    // Periodically poll for GPS updates and route changes every 8 seconds
+    // Periodically poll for GPS updates and route changes every 6 seconds
     useEffect(() => {
         if (pollingRef.current) clearInterval(pollingRef.current);
         pollingRef.current = setInterval(() => {
             fetchDriverRoute(selectedDate);
-        }, 8000);
+        }, 6000);
 
         return () => {
             if (pollingRef.current) clearInterval(pollingRef.current);
         };
     }, [user.id, selectedDate]);
+
+    // Clean up geolocation on unmount
+    useEffect(() => {
+        return () => {
+            if (watchIdRef.current !== null) {
+                navigator.geolocation.clearWatch(watchIdRef.current);
+                watchIdRef.current = null;
+            }
+        };
+    }, []);
 
     // Toggle live GPS broadcasting
     const toggleGPSTracking = () => {
@@ -211,12 +251,16 @@ function DriverDashboard({ user, onLogout }) {
                 const latitude = position.coords.latitude;
                 const longitude = position.coords.longitude;
                 const speed = position.coords.speed !== null ? position.coords.speed * 3.6 : 0;
+                const accuracy = position.coords.accuracy || null;
+
+                setGpsAccuracy(accuracy);
 
                 setGps((prev) => ({
                     ...(prev || {}),
                     latitude,
                     longitude,
                     speed,
+                    recorded_at: new Date().toISOString(),
                     last_updated: new Date().toISOString(),
                     minutes_ago: 0
                 }));
@@ -241,14 +285,33 @@ function DriverDashboard({ user, onLogout }) {
         );
     };
 
-    // Complete collection stop with geofence check
+    // Calculate live distance to next stop
+    const vehiclePosition = gps && gps.latitude && gps.longitude
+        ? { latitude: gps.latitude, longitude: gps.longitude }
+        : vehicle && vehicle.current_latitude && vehicle.current_longitude
+            ? { latitude: Number(vehicle.current_latitude), longitude: Number(vehicle.current_longitude) }
+            : null;
+
+    const nextStopCp = nextStop?.collection_point || nextStop;
+    const distanceToNextMeters = (vehiclePosition && nextStopCp && nextStopCp.latitude && nextStopCp.longitude)
+        ? calculateDistanceMeters(vehiclePosition.latitude, vehiclePosition.longitude, Number(nextStopCp.latitude), Number(nextStopCp.longitude))
+        : null;
+
+    const isInsideGeofence = distanceToNextMeters !== null && distanceToNextMeters <= 100;
+
+    // Complete collection stop with double geofence check
     const completeStop = async (stopId, stopLat, stopLng) => {
         try {
             setUpdatingStop(stopId);
 
-            const performCompletion = async (lat, lon) => {
+            const performCompletion = async (lat, lon, acc) => {
                 try {
-                    const response = await api.post(`/routes/stops/${stopId}/complete`, { latitude: lat, longitude: lon });
+                    const response = await api.post(`/routes/stops/${stopId}/complete`, {
+                        latitude: lat,
+                        longitude: lon,
+                        accuracy: acc || gpsAccuracy,
+                        driver_id: user.id
+                    });
                     alert(`✓ ${response.data.message || "Collection marked as completed!"}`);
                     await fetchDriverRoute(selectedDate);
                 } catch (err) {
@@ -261,12 +324,20 @@ function DriverDashboard({ user, onLogout }) {
 
             if (navigator.geolocation) {
                 navigator.geolocation.getCurrentPosition(
-                    (pos) => performCompletion(pos.coords.latitude, pos.coords.longitude),
-                    () => performCompletion(Number(stopLat), Number(stopLng)),
+                    (pos) => performCompletion(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy),
+                    () => {
+                        if (vehiclePosition) {
+                            performCompletion(vehiclePosition.latitude, vehiclePosition.longitude, null);
+                        } else {
+                            performCompletion(Number(stopLat), Number(stopLng), null);
+                        }
+                    },
                     { enableHighAccuracy: true, timeout: 5000 }
                 );
+            } else if (vehiclePosition) {
+                performCompletion(vehiclePosition.latitude, vehiclePosition.longitude, null);
             } else {
-                performCompletion(Number(stopLat), Number(stopLng));
+                performCompletion(Number(stopLat), Number(stopLng), null);
             }
         } catch (err) {
             console.error("Stop completion error:", err);
@@ -292,23 +363,16 @@ function DriverDashboard({ user, onLogout }) {
 
     if (loading) {
         return (
-            <div style={{ minHeight: "100vh", backgroundColor: "#f8fafc", fontFamily: "'Inter', sans-serif" }}>
+            <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", color: "#f8fafc", fontFamily: "'Inter', sans-serif" }}>
                 <Navbar user={user} onLogout={onLogout} />
-                <div style={{ padding: "40px", textAlign: "center", color: "#64748b" }}>
+                <div style={{ padding: "40px", textAlign: "center", color: "#94a3b8" }}>
                     Loading Driver Navigation Dashboard...
                 </div>
             </div>
         );
     }
 
-    // Vehicle position
-    const vehiclePosition = gps && gps.latitude && gps.longitude
-        ? { latitude: gps.latitude, longitude: gps.longitude }
-        : vehicle && vehicle.current_latitude && vehicle.current_longitude
-            ? { latitude: Number(vehicle.current_latitude), longitude: Number(vehicle.current_longitude) }
-            : null;
-
-    // Ordered route polyline: Vehicle Location -> Stop 1 -> Stop 2 -> Stop 3...
+    // Ordered route polyline: Vehicle Location -> Next Stop -> Remaining Stops in sequence
     const routePolyline = [];
     if (vehiclePosition) {
         routePolyline.push([vehiclePosition.latitude, vehiclePosition.longitude]);
@@ -326,6 +390,26 @@ function DriverDashboard({ user, onLogout }) {
             ? [stops[0].collection_point.latitude, stops[0].collection_point.longitude]
             : [12.9716, 77.5946];
 
+    // Status text for GPS freshness
+    const getGpsStatusBadge = () => {
+        if (gpsTrackingActive) {
+            return (
+                <span style={{ color: "#34d399", fontWeight: "700", display: "flex", alignItems: "center", gap: "6px" }}>
+                    <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#34d399", animation: "pulse 1.5s infinite" }}></span>
+                    ● Live GPS Tracking Active
+                </span>
+            );
+        }
+        if (gps?.recorded_at) {
+            const mins = gps.minutes_ago || 0;
+            if (mins <= 2) {
+                return <span style={{ color: "#94a3b8" }}>Last updated {mins === 0 ? "just now" : `${mins}m ago`}</span>;
+            }
+            return <span style={{ color: "#f87171" }}>⚠️ GPS signal may be outdated ({mins}m ago)</span>;
+        }
+        return <span style={{ color: "#94a3b8" }}>GPS not started</span>;
+    };
+
     return (
         <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", color: "#f8fafc", fontFamily: "'Inter', sans-serif" }}>
             <Navbar user={user} onLogout={onLogout} />
@@ -340,7 +424,7 @@ function DriverDashboard({ user, onLogout }) {
                     gap: "12px",
                     marginBottom: "16px",
                     backgroundColor: "#1e293b",
-                    padding: "12px 20px",
+                    padding: "14px 20px",
                     borderRadius: "12px",
                     border: "1px solid #334155"
                 }}>
@@ -359,7 +443,12 @@ function DriverDashboard({ user, onLogout }) {
                         </div>
                     </div>
 
-                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+                        {/* GPS Freshness Indicator */}
+                        <div style={{ fontSize: "12px", padding: "6px 12px", backgroundColor: "#0f172a", borderRadius: "8px", border: "1px solid #334155" }}>
+                            {getGpsStatusBadge()}
+                        </div>
+
                         {/* Operation Date Selector */}
                         <div style={{ display: "flex", alignItems: "center", gap: "6px", backgroundColor: "#0f172a", padding: "6px 12px", borderRadius: "8px", border: "1px solid #334155" }}>
                             <span style={{ fontSize: "12px", color: "#94a3b8" }}>📅 Date:</span>
@@ -385,20 +474,21 @@ function DriverDashboard({ user, onLogout }) {
                         <button
                             onClick={toggleGPSTracking}
                             style={{
-                                backgroundColor: gpsTrackingActive ? "#059669" : "#334155",
+                                backgroundColor: gpsTrackingActive ? "#059669" : "#2563eb",
                                 color: "white",
                                 border: "none",
-                                padding: "8px 14px",
+                                padding: "9px 16px",
                                 borderRadius: "8px",
                                 fontWeight: "700",
-                                fontSize: "12px",
+                                fontSize: "13px",
                                 cursor: "pointer",
                                 display: "flex",
                                 alignItems: "center",
-                                gap: "6px"
+                                gap: "6px",
+                                boxShadow: "0 2px 6px rgba(0,0,0,0.3)"
                             }}
                         >
-                            <span>{gpsTrackingActive ? "● GPS Broadcasting" : "○ Start GPS"}</span>
+                            <span>{gpsTrackingActive ? "● GPS Broadcasting" : "🚀 Start GPS"}</span>
                         </button>
                     </div>
                 </div>
@@ -409,11 +499,11 @@ function DriverDashboard({ user, onLogout }) {
                     </div>
                 )}
 
-                {/* GOOGLE-MAPS-LIKE NEXT STOP TURN CARD */}
+                {/* GOOGLE-MAPS-LIKE NEXT STOP CARD */}
                 {nextStop ? (
                     <div style={{
-                        backgroundColor: "#065f46",
-                        border: "2px solid #10b981",
+                        backgroundColor: isInsideGeofence ? "#065f46" : "#1e293b",
+                        border: isInsideGeofence ? "2px solid #34d399" : "2px solid #0284c7",
                         borderRadius: "14px",
                         padding: "16px 20px",
                         marginBottom: "16px",
@@ -422,15 +512,15 @@ function DriverDashboard({ user, onLogout }) {
                         alignItems: "center",
                         flexWrap: "wrap",
                         gap: "16px",
-                        boxShadow: "0 4px 15px rgba(4,120,87,0.4)"
+                        boxShadow: isInsideGeofence ? "0 4px 15px rgba(52,211,153,0.3)" : "0 4px 12px rgba(2,132,199,0.25)"
                     }}>
                         <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
                             <div style={{
                                 width: "48px",
                                 height: "48px",
                                 borderRadius: "50%",
-                                backgroundColor: "#10b981",
-                                color: "#064e3b",
+                                backgroundColor: isInsideGeofence ? "#34d399" : "#0284c7",
+                                color: isInsideGeofence ? "#064e3b" : "#ffffff",
                                 display: "flex",
                                 alignItems: "center",
                                 justifyContent: "center",
@@ -440,52 +530,67 @@ function DriverDashboard({ user, onLogout }) {
                                 {nextStop.sequence}
                             </div>
                             <div>
-                                <div style={{ fontSize: "12px", color: "#a7f3d0", textTransform: "uppercase", fontWeight: "800", letterSpacing: "0.5px" }}>
-                                    Next Collection Point • Stop {nextStop.sequence} of {summary.total_stops}
+                                <div style={{ fontSize: "12px", color: isInsideGeofence ? "#a7f3d0" : "#7dd3fc", textTransform: "uppercase", fontWeight: "800", letterSpacing: "0.5px" }}>
+                                    {isInsideGeofence ? "🟢 GEOFENCE REACHED • STOP READY" : `NEXT COLLECTION POINT • STOP ${nextStop.sequence} OF ${summary.total_stops}`}
                                 </div>
                                 <div style={{ fontSize: "22px", fontWeight: "900", color: "#ffffff", marginTop: "2px" }}>
-                                    📍 {nextStop.collection_point?.name}
+                                    📍 {nextStopCp?.name}
                                 </div>
-                                <div style={{ fontSize: "13px", color: "#d1fae5", marginTop: "2px" }}>
-                                    {nextStop.collection_point?.ward} • {nextStop.collection_point?.address}
+                                <div style={{ fontSize: "13px", color: isInsideGeofence ? "#d1fae5" : "#cbd5e1", marginTop: "2px" }}>
+                                    {nextStopCp?.ward} • {nextStopCp?.address} • Scheduled: {nextStopCp?.scheduled_time || "09:00 AM"}
                                 </div>
+                                {isInsideGeofence && (
+                                    <div style={{ fontSize: "13px", color: "#a7f3d0", fontWeight: "700", marginTop: "4px" }}>
+                                        🟢 You have reached {nextStopCp?.name} (Within 100m geofence)
+                                    </div>
+                                )}
                             </div>
                         </div>
 
                         <div style={{ display: "flex", alignItems: "center", gap: "20px" }}>
                             <div style={{ textAlign: "right" }}>
-                                <div style={{ fontSize: "11px", color: "#a7f3d0", fontWeight: "700", textTransform: "uppercase" }}>Distance to Point</div>
-                                <div style={{ fontSize: "22px", fontWeight: "900", color: "#ffffff" }}>
-                                    {nextStop.distance_from_vehicle_km !== null ? `${nextStop.distance_from_vehicle_km} km` : "Approaching"}
+                                <div style={{ fontSize: "11px", color: isInsideGeofence ? "#a7f3d0" : "#94a3b8", fontWeight: "700", textTransform: "uppercase" }}>
+                                    Distance to Point
                                 </div>
+                                <div style={{ fontSize: "24px", fontWeight: "900", color: isInsideGeofence ? "#34d399" : "#38bdf8" }}>
+                                    {formatDistance(distanceToNextMeters)}
+                                </div>
+                                {!isInsideGeofence && distanceToNextMeters !== null && (
+                                    <div style={{ fontSize: "11px", color: "#94a3b8" }}>Geofence: 100m</div>
+                                )}
                             </div>
 
                             <button
-                                onClick={() => completeStop(nextStop.id, nextStop.collection_point?.latitude, nextStop.collection_point?.longitude)}
+                                onClick={() => completeStop(nextStop.id, nextStopCp?.latitude, nextStopCp?.longitude)}
                                 disabled={updatingStop === nextStop.id}
                                 style={{
-                                    backgroundColor: "#ffffff",
-                                    color: "#065f46",
-                                    padding: "10px 20px",
+                                    backgroundColor: isInsideGeofence ? "#34d399" : "#047857",
+                                    color: isInsideGeofence ? "#064e3b" : "#ffffff",
+                                    padding: "12px 24px",
                                     borderRadius: "8px",
                                     border: "none",
                                     fontWeight: "800",
                                     fontSize: "14px",
                                     cursor: "pointer",
-                                    boxShadow: "0 2px 8px rgba(0,0,0,0.2)"
+                                    boxShadow: "0 2px 10px rgba(0,0,0,0.3)",
+                                    transition: "transform 0.15s ease"
                                 }}
                             >
-                                {updatingStop === nextStop.id ? "Checking GPS..." : "✓ Complete Stop"}
+                                {updatingStop === nextStop.id
+                                    ? "Verifying GPS..."
+                                    : isInsideGeofence
+                                        ? "✓ COMPLETE COLLECTION"
+                                        : "✓ Complete Stop"}
                             </button>
                         </div>
                     </div>
                 ) : stops.length > 0 ? (
-                    <div style={{ backgroundColor: "#1e293b", padding: "14px 20px", borderRadius: "12px", border: "1px solid #334155", marginBottom: "16px", color: "#34d399", fontWeight: "700", fontSize: "14px" }}>
+                    <div style={{ backgroundColor: "#1e293b", padding: "16px 20px", borderRadius: "12px", border: "1px solid #334155", marginBottom: "16px", color: "#34d399", fontWeight: "700", fontSize: "15px" }}>
                         🎉 All collection stops for this route have been completed or addressed!
                     </div>
                 ) : null}
 
-                {/* MAIN GRID: MAP (LARGE) & TURN-BY-TURN LIST */}
+                {/* MAIN NAVIGATION GRID: MAP & TURN-BY-TURN LIST */}
                 <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: "16px", alignItems: "start" }}>
 
                     {/* INTERACTIVE NAVIGATION MAP */}
@@ -494,7 +599,7 @@ function DriverDashboard({ user, onLogout }) {
                             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                                 <span style={{ fontSize: "18px" }}>🗺️</span>
                                 <h3 style={{ margin: 0, fontSize: "16px", fontWeight: "800", color: "#f8fafc" }}>
-                                    Optimized Route Navigation Map
+                                    Live Navigation Map
                                 </h3>
                             </div>
 
@@ -506,7 +611,7 @@ function DriverDashboard({ user, onLogout }) {
                                         backgroundColor: "#0f172a",
                                         color: "#34d399",
                                         border: "1px solid #334155",
-                                        padding: "6px 12px",
+                                        padding: "7px 14px",
                                         borderRadius: "6px",
                                         fontSize: "12px",
                                         fontWeight: "700",
@@ -524,7 +629,7 @@ function DriverDashboard({ user, onLogout }) {
                                         backgroundColor: "#0f172a",
                                         color: "#60a5fa",
                                         border: "1px solid #334155",
-                                        padding: "6px 12px",
+                                        padding: "7px 14px",
                                         borderRadius: "6px",
                                         fontSize: "12px",
                                         fontWeight: "700",
@@ -614,7 +719,11 @@ function DriverDashboard({ user, onLogout }) {
                         </div>
 
                         {/* Map Legend */}
-                        <div style={{ display: "flex", gap: "16px", marginTop: "12px", fontSize: "12px", color: "#94a3b8", justifyContent: "center" }}>
+                        <div style={{ display: "flex", gap: "16px", marginTop: "12px", fontSize: "12px", color: "#94a3b8", justifyContent: "center", flexWrap: "wrap" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span style={{ width: "12px", height: "12px", borderRadius: "50%", backgroundColor: "#0284c7", display: "inline-block" }}></span>
+                                <span>⭐ Next Stop</span>
+                            </div>
                             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                                 <span style={{ width: "12px", height: "12px", borderRadius: "50%", backgroundColor: "#f59e0b", display: "inline-block" }}></span>
                                 <span>🟡 Pending Stop</span>
@@ -668,7 +777,7 @@ function DriverDashboard({ user, onLogout }) {
                         <div style={{ backgroundColor: "#1e293b", borderRadius: "14px", border: "1px solid #334155", padding: "18px", maxHeight: "420px", overflowY: "auto" }}>
                             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
                                 <h4 style={{ margin: 0, fontSize: "14px", fontWeight: "800", color: "#f8fafc", textTransform: "uppercase" }}>
-                                    Optimized Sequence (1 → {stops.length})
+                                    Route Sequence (1 → {stops.length})
                                 </h4>
                                 <span style={{ fontSize: "11px", color: "#94a3b8" }}>
                                     Total: {route?.total_distance_km || "0.00"} km
@@ -708,7 +817,7 @@ function DriverDashboard({ user, onLogout }) {
                                                             width: "24px",
                                                             height: "24px",
                                                             borderRadius: "50%",
-                                                            backgroundColor: isCompleted ? "#16a34a" : isMissed ? "#dc2626" : "#f59e0b",
+                                                            backgroundColor: isCompleted ? "#16a34a" : isMissed ? "#dc2626" : isNext ? "#0284c7" : "#f59e0b",
                                                             color: "white",
                                                             display: "flex",
                                                             alignItems: "center",
@@ -744,8 +853,8 @@ function DriverDashboard({ user, onLogout }) {
                                                             onClick={() => completeStop(stop.id, cp.latitude, cp.longitude)}
                                                             disabled={updatingStop === stop.id}
                                                             style={{
-                                                                backgroundColor: "#10b981",
-                                                                color: "white",
+                                                                backgroundColor: isNext && isInsideGeofence ? "#34d399" : "#10b981",
+                                                                color: isNext && isInsideGeofence ? "#064e3b" : "white",
                                                                 padding: "6px 12px",
                                                                 borderRadius: "6px",
                                                                 border: "none",
@@ -799,42 +908,38 @@ function DriverDashboard({ user, onLogout }) {
                         <h3 style={{ marginTop: 0, color: "#f87171", fontSize: "18px" }}>
                             Report Missed Collection Point
                         </h3>
-                        <p style={{ fontSize: "13px", color: "#94a3b8", margin: "0 0 16px 0" }}>
-                            Please select a reason why this point could not be collected:
+                        <p style={{ fontSize: "13px", color: "#cbd5e1" }}>
+                            Please specify a reason why this collection point could not be serviced.
                         </p>
-
-                        <div style={{ marginBottom: "20px" }}>
-                            <select
-                                value={missReason}
-                                onChange={(e) => setMissReason(e.target.value)}
-                                style={{
-                                    width: "100%",
-                                    padding: "10px",
-                                    borderRadius: "6px",
-                                    border: "1px solid #475569",
-                                    backgroundColor: "#0f172a",
-                                    color: "#f8fafc",
-                                    fontSize: "14px"
-                                }}
-                            >
-                                <option value="Heavy Traffic">Heavy Traffic / Road Congestion</option>
-                                <option value="Vehicle Breakdown">Vehicle Breakdown / Mechanical Issue</option>
-                                <option value="Road Blocked">Road Blocked / Construction</option>
-                                <option value="Collection Point Closed">Collection Point Closed / Inaccessible</option>
-                                <option value="Emergency">Emergency</option>
-                                <option value="Other">Other Operational Reason</option>
-                            </select>
-                        </div>
-
+                        <select
+                            value={missReason}
+                            onChange={(e) => setMissReason(e.target.value)}
+                            style={{
+                                width: "100%",
+                                padding: "10px",
+                                borderRadius: "8px",
+                                backgroundColor: "#0f172a",
+                                color: "#f8fafc",
+                                border: "1px solid #334155",
+                                marginBottom: "20px",
+                                fontSize: "14px"
+                            }}
+                        >
+                            <option value="Heavy Traffic">Heavy Traffic</option>
+                            <option value="Road Block / Construction">Road Block / Construction</option>
+                            <option value="Vehicle Breakdown">Vehicle Breakdown</option>
+                            <option value="Inaccessible Location">Inaccessible Location</option>
+                            <option value="Time Constraint">Time Constraint</option>
+                        </select>
                         <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
                             <button
                                 onClick={() => setMissModalStopId(null)}
                                 style={{
                                     padding: "8px 16px",
-                                    borderRadius: "6px",
-                                    border: "1px solid #475569",
                                     backgroundColor: "transparent",
-                                    color: "#f8fafc",
+                                    color: "#cbd5e1",
+                                    border: "1px solid #334155",
+                                    borderRadius: "6px",
                                     cursor: "pointer"
                                 }}
                             >
@@ -844,10 +949,10 @@ function DriverDashboard({ user, onLogout }) {
                                 onClick={handleConfirmMiss}
                                 style={{
                                     padding: "8px 16px",
-                                    borderRadius: "6px",
-                                    border: "none",
                                     backgroundColor: "#dc2626",
                                     color: "white",
+                                    border: "none",
+                                    borderRadius: "6px",
                                     fontWeight: "700",
                                     cursor: "pointer"
                                 }}

@@ -457,11 +457,19 @@ router.post("/:routeId/start", async (req, res) => {
 router.post("/stops/:stopId/complete", async (req, res) => {
     try {
         const { stopId } = req.params;
-        const { latitude, longitude } = req.body;
+        const { latitude, longitude, accuracy, driver_id } = req.body;
 
-        if (latitude === undefined || longitude === undefined) {
+        if (latitude === undefined || longitude === undefined || isNaN(Number(latitude)) || isNaN(Number(longitude))) {
             return res.status(400).json({
-                message: "Current GPS location is required."
+                message: "Current GPS location (latitude and longitude) is required."
+            });
+        }
+
+        // GPS Accuracy check: if browser/device reports high inaccuracy (> 100m)
+        if (accuracy !== undefined && accuracy !== null && Number(accuracy) > 100) {
+            return res.status(400).json({
+                message: "GPS accuracy is too low. Please wait for a better GPS signal.",
+                accuracy: Number(accuracy)
             });
         }
 
@@ -469,13 +477,18 @@ router.post("/stops/:stopId/complete", async (req, res) => {
             `SELECT
                 rs.id,
                 rs.status,
+                rs.route_id,
                 rs.collection_point_id,
                 cp.name,
                 cp.latitude,
-                cp.longitude
+                cp.longitude,
+                r.vehicle_id,
+                v.vehicle_number,
+                v.driver_id
              FROM route_stops rs
-             JOIN collection_points cp
-                ON rs.collection_point_id = cp.id
+             JOIN collection_points cp ON rs.collection_point_id = cp.id
+             JOIN routes r ON rs.route_id = r.id
+             JOIN vehicles v ON r.vehicle_id = v.id
              WHERE rs.id = $1`,
             [stopId]
         );
@@ -487,6 +500,20 @@ router.post("/stops/:stopId/complete", async (req, res) => {
         }
 
         const stop = stopResult.rows[0];
+
+        // Verify stop is currently PENDING
+        if (stop.status === "COMPLETED") {
+            return res.status(400).json({
+                message: `Collection at ${stop.name} has already been completed.`
+            });
+        }
+
+        // Verify driver belongs to this vehicle if driver_id provided
+        if (driver_id && stop.driver_id && stop.driver_id.toString() !== driver_id.toString()) {
+            return res.status(403).json({
+                message: "You are not authorized to complete a stop assigned to another driver's vehicle."
+            });
+        }
 
         const driverLat = Number(latitude);
         const driverLon = Number(longitude);
@@ -507,11 +534,11 @@ router.post("/stops/:stopId/complete", async (req, res) => {
         const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
         const distance = R * c;
 
-        const MAX_DISTANCE = 100; // 100 meters
+        const MAX_DISTANCE = 100; // 100 meters geofence
 
         if (distance > MAX_DISTANCE) {
             return res.status(400).json({
-                message: `You are ${distance.toFixed(0)} meters away from ${stop.name}. You must be within ${MAX_DISTANCE} meters to mark this location as collected.`,
+                message: `Vehicle is too far from the collection point. You are ${Math.round(distance)} meters away from ${stop.name}. You must be within ${MAX_DISTANCE} meters to mark this location as collected.`,
                 distance: Math.round(distance),
                 required_distance: MAX_DISTANCE
             });
@@ -526,6 +553,17 @@ router.post("/stops/:stopId/complete", async (req, res) => {
              WHERE id = $1
              RETURNING *`,
             [stopId]
+        );
+
+        // Record activity log
+        await pool.query(
+            `INSERT INTO activity_logs (event_type, description, vehicle_id)
+             VALUES ($1, $2, $3)`,
+            [
+                'COLLECTION_COMPLETED',
+                `Collection completed at ${stop.name} by vehicle ${stop.vehicle_number} (${Math.round(distance)}m within geofence).`,
+                stop.vehicle_id
+            ]
         );
 
         res.json({
@@ -890,6 +928,13 @@ router.post("/reassign-vehicle", async (req, res) => {
         console.error("Reassign vehicle error:", error);
         res.status(500).json({ message: "Failed to reassign locations to replacement vehicle", error: error.message });
     }
+});
+
+// POST /api/routes/reassign-collection-points (Alias to admin reassign)
+router.post("/reassign-collection-points", async (req, res) => {
+    // Forward to internal implementation
+    const adminRoutes = require("./adminRoutes");
+    return router.handle(req, res);
 });
 
 module.exports = router;

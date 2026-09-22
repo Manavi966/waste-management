@@ -1,11 +1,21 @@
 import React, { useState, useEffect } from "react";
 import api from "../services/api";
 
-function AssignVehiclePage() {
+function AssignVehiclePage({ selectedDate: propSelectedDate, setSelectedDate: propSetSelectedDate }) {
     const [vehicles, setVehicles] = useState([]);
     const [points, setPoints] = useState([]);
     const [counts, setCounts] = useState({ total: 0, available: 0, assigned_to_current: 0, assigned_to_other: 0, total_assigned: 0 });
-    const [selectedDate, setSelectedDate] = useState("2026-09-20");
+    const [localSelectedDate, setLocalSelectedDate] = useState(() => {
+        return propSelectedDate || localStorage.getItem("authority_operation_date") || "2026-09-20";
+    });
+    const selectedDate = propSelectedDate || localSelectedDate;
+    const setSelectedDate = (newDate) => {
+        if (propSetSelectedDate) {
+            propSetSelectedDate(newDate);
+        }
+        setLocalSelectedDate(newDate);
+        localStorage.setItem("authority_operation_date", newDate);
+    };
     const [selectedVehicleId, setSelectedVehicleId] = useState("");
     const [selectedPointIds, setSelectedPointIds] = useState([]);
     const [optimizedRoute, setOptimizedRoute] = useState(null);
@@ -191,6 +201,8 @@ function AssignVehiclePage() {
 
             // Immediately refresh availability list from backend
             await fetchPointsAndRoute(selectedVehicleId, selectedDate);
+            window.dispatchEvent(new CustomEvent("vehicle_assignment_updated", { detail: { date: selectedDate } }));
+            localStorage.setItem("last_assignment_timestamp", Date.now().toString());
         } catch (err) {
             console.error("Assignment error:", err);
             const isConflict = err.response?.status === 409;
@@ -238,6 +250,8 @@ function AssignVehiclePage() {
             if (selectedVehicleId) {
                 await fetchPointsAndRoute(selectedVehicleId, selectedDate);
             }
+            window.dispatchEvent(new CustomEvent("vehicle_assignment_updated", { detail: { date: selectedDate } }));
+            localStorage.setItem("last_assignment_timestamp", Date.now().toString());
         } catch (err) {
             console.error("Reassignment error:", err);
             setMessage({
@@ -436,7 +450,7 @@ function AssignVehiclePage() {
                                     value={v.id}
                                     disabled={isMaint}
                                 >
-                                    {v.vehicle_number} — [{v.status}] — Driver: {v.driver_name || "Unassigned"} {isMaint ? "(Disabled)" : ""}
+                                    {v.vehicle_number} — [{isMaint ? "🔧 MAINTENANCE" : "🟢 IN SERVICE"}] — Driver: {v.driver_name || "Unassigned"} {isMaint ? "(🔧 Vehicle under maintenance)" : ""}
                                 </option>
                             );
                         })}
@@ -459,7 +473,7 @@ function AssignVehiclePage() {
                     alignItems: "center",
                     gap: "10px"
                 }}>
-                    <span style={{ fontSize: "20px" }}>⚠️</span>
+                    <span style={{ fontSize: "20px" }}>🔧</span>
                     <span>Vehicle {selectedVehicle.vehicle_number} is under maintenance and cannot receive new collection point assignments.</span>
                 </div>
             )}
@@ -496,15 +510,6 @@ function AssignVehiclePage() {
                         </div>
                         <div style={{ fontSize: "26px", fontWeight: "800", color: "#475569", marginTop: "4px" }}>
                             {counts.assigned_to_other}
-                        </div>
-                    </div>
-
-                    <div style={{ backgroundColor: "#faf5ff", padding: "14px 18px", borderRadius: "10px", border: "1px solid #e9d5ff" }}>
-                        <div style={{ fontSize: "12px", color: "#6b21a8", fontWeight: "700", display: "flex", alignItems: "center", gap: "6px" }}>
-                            <span>📊</span> Total Collection Points:
-                        </div>
-                        <div style={{ fontSize: "26px", fontWeight: "800", color: "#7e22ce", marginTop: "4px" }}>
-                            {counts.total}
                         </div>
                     </div>
                 </div>

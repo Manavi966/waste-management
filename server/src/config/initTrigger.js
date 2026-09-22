@@ -19,6 +19,7 @@ async function initAssignmentIntegrity() {
                     WHERE rs.collection_point_id = NEW.collection_point_id
                       AND r.route_date = target_date
                       AND r.id != NEW.route_id
+                      AND (TG_OP = 'INSERT' OR rs.id != NEW.id)
                     LIMIT 1;
 
                     IF existing_veh_num IS NOT NULL THEN

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import api from "../services/api";
 
-function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
+function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: propSelectedDate, setSelectedDate: propSetSelectedDate }) {
     const [vehicles, setVehicles] = useState([]);
     const [loading, setLoading] = useState(true);
     const [searchTerm, setSearchTerm] = useState("");
@@ -9,14 +9,28 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
     const [newVehicleNumber, setNewVehicleNumber] = useState("");
     const [newStatus, setNewStatus] = useState("AVAILABLE");
 
+    // Operation Date state synchronized with Authority Dashboard
+    const [localSelectedDate, setLocalSelectedDate] = useState(() => {
+        return propSelectedDate || localStorage.getItem("authority_operation_date") || "2026-09-20";
+    });
+    const selectedDate = propSelectedDate || localSelectedDate;
+
+    const handleDateChange = (newDate) => {
+        if (propSetSelectedDate) {
+            propSetSelectedDate(newDate);
+        }
+        setLocalSelectedDate(newDate);
+        localStorage.setItem("authority_operation_date", newDate);
+    };
+
     // Vehicle Details Modal State
     const [selectedVehicleDetails, setSelectedVehicleDetails] = useState(null);
     const [detailsLoading, setDetailsLoading] = useState(false);
     const [detailsTab, setDetailsTab] = useState("ALL"); // ALL, COMPLETED, PENDING, MISSED
 
-    const fetchVehicles = async () => {
+    const fetchVehicles = async (dateToUse = selectedDate) => {
         try {
-            const response = await api.get("/vehicles");
+            const response = await api.get(`/vehicles?date=${dateToUse}`);
             setVehicles(response.data || []);
         } catch (error) {
             console.error("Failed to fetch vehicles:", error);
@@ -26,14 +40,52 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
     };
 
     useEffect(() => {
-        fetchVehicles();
-    }, []);
+        fetchVehicles(selectedDate);
+
+        const handleFocusOrUpdate = () => {
+            const storedDate = localStorage.getItem("authority_operation_date") || selectedDate;
+            fetchVehicles(storedDate);
+        };
+
+        window.addEventListener("focus", handleFocusOrUpdate);
+        window.addEventListener("vehicle_assignment_updated", handleFocusOrUpdate);
+        window.addEventListener("storage", handleFocusOrUpdate);
+
+        return () => {
+            window.removeEventListener("focus", handleFocusOrUpdate);
+            window.removeEventListener("vehicle_assignment_updated", handleFocusOrUpdate);
+            window.removeEventListener("storage", handleFocusOrUpdate);
+        };
+    }, [selectedDate]);
 
     useEffect(() => {
         if (initialVehicleId) {
-            handleViewDetails(initialVehicleId);
+            handleViewDetails(initialVehicleId, selectedDate);
         }
-    }, [initialVehicleId]);
+    }, [initialVehicleId, selectedDate]);
+
+    // Live auto-refresh when vehicle details modal is open so newly assigned points reflect instantly
+    useEffect(() => {
+        const vehicleId = selectedVehicleDetails?.vehicle?.vehicle_id || selectedVehicleDetails?.vehicle?.id;
+        if (!vehicleId) return;
+
+        const refreshDetailsSilently = async () => {
+            try {
+                const response = await api.get(`/vehicles/${vehicleId}/details?date=${selectedDate}`);
+                setSelectedVehicleDetails(response.data);
+            } catch (error) {
+                console.error("Silent vehicle details refresh error:", error);
+            }
+        };
+
+        const interval = setInterval(refreshDetailsSilently, 3000);
+        window.addEventListener("vehicle_assignment_updated", refreshDetailsSilently);
+
+        return () => {
+            clearInterval(interval);
+            window.removeEventListener("vehicle_assignment_updated", refreshDetailsSilently);
+        };
+    }, [selectedVehicleDetails?.vehicle?.vehicle_id, selectedVehicleDetails?.vehicle?.id, selectedDate]);
 
     const filteredVehicles = (vehicles || []).filter((v) => {
         if (!searchTerm) return true;
@@ -53,17 +105,17 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
             });
             setShowAddModal(false);
             setNewVehicleNumber("");
-            fetchVehicles();
+            fetchVehicles(selectedDate);
         } catch (error) {
             alert(error.response?.data?.message || "Failed to add vehicle");
         }
     };
 
-    const handleViewDetails = async (vehicleId) => {
+    const handleViewDetails = async (vehicleId, dateToUse = selectedDate) => {
         setDetailsLoading(true);
         setDetailsTab("ALL");
         try {
-            const response = await api.get(`/vehicles/${vehicleId}/details`);
+            const response = await api.get(`/vehicles/${vehicleId}/details?date=${dateToUse}`);
             setSelectedVehicleDetails(response.data);
         } catch (error) {
             console.error("Fetch vehicle details error:", error);
@@ -79,7 +131,7 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
             if (res.data.requires_reassignment) {
                 alert(`⚠️ ${res.data.message}\n\nPlease navigate to "Assign Vehicle" to reassign its collection points to an active vehicle.`);
             }
-            fetchVehicles();
+            fetchVehicles(selectedDate);
         } catch (error) {
             alert(error.response?.data?.message || "Failed to update vehicle status");
         }
@@ -129,7 +181,7 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
             </div>
 
             {/* Filter bar */}
-            <div style={{ backgroundColor: "#ffffff", padding: "16px", borderRadius: "10px", marginBottom: "20px", border: "1px solid #e2e8f0" }}>
+            <div style={{ backgroundColor: "#ffffff", padding: "16px", borderRadius: "10px", marginBottom: "20px", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>
                 <input
                     type="text"
                     placeholder="Search by vehicle number or driver..."
@@ -143,6 +195,22 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
                         fontSize: "14px"
                     }}
                 />
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <label style={{ fontSize: "13px", fontWeight: "600", color: "#475569" }}>Operation Date:</label>
+                    <input
+                        type="date"
+                        value={selectedDate}
+                        onChange={(e) => handleDateChange(e.target.value)}
+                        style={{
+                            padding: "6px 12px",
+                            borderRadius: "6px",
+                            border: "1px solid #cbd5e1",
+                            fontSize: "13px",
+                            fontWeight: "600",
+                            color: "#0f172a"
+                        }}
+                    />
+                </div>
             </div>
 
             {/* Table */}
@@ -186,11 +254,11 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
                                                     cursor: "pointer"
                                                 }}
                                             >
-                                                <option value="AVAILABLE">AVAILABLE</option>
-                                                <option value="ACTIVE">ACTIVE</option>
-                                                <option value="IN_SERVICE">IN_SERVICE</option>
-                                                <option value="MAINTENANCE">MAINTENANCE</option>
-                                                <option value="INACTIVE">INACTIVE</option>
+                                                <option value="IN_SERVICE">🟢 IN_SERVICE</option>
+                                                <option value="MAINTENANCE">🔧 MAINTENANCE</option>
+                                                <option value="AVAILABLE">🟢 AVAILABLE</option>
+                                                <option value="ACTIVE">🟢 ACTIVE</option>
+                                                <option value="INACTIVE">⚪ INACTIVE</option>
                                             </select>
                                         </td>
                                         <td style={{ padding: "14px 20px", color: "#334155" }}>
@@ -295,18 +363,19 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle }) {
                                         🚛 {selectedVehicleDetails.vehicle?.vehicle_number}
                                     </h2>
                                     <span style={{
-                                        backgroundColor: "#ecfdf5",
-                                        color: "#047857",
+                                        backgroundColor: (selectedVehicleDetails.vehicle?.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#fee2e2" : "#ecfdf5",
+                                        color: (selectedVehicleDetails.vehicle?.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#b91c1c" : "#047857",
                                         padding: "3px 10px",
                                         borderRadius: "12px",
                                         fontSize: "12px",
-                                        fontWeight: "700"
+                                        fontWeight: "700",
+                                        border: `1px solid ${(selectedVehicleDetails.vehicle?.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#fca5a5" : "#a7f3d0"}`
                                     }}>
-                                        {selectedVehicleDetails.vehicle?.vehicle_status || "In Service"}
+                                        {(selectedVehicleDetails.vehicle?.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "🔧 MAINTENANCE" : "🟢 IN SERVICE"}
                                     </span>
                                 </div>
                                 <p style={{ margin: "4px 0 0 0", color: "#64748b", fontSize: "14px" }}>
-                                    Driver: <strong>{selectedVehicleDetails.vehicle?.driver_name || "Unassigned"}</strong> {selectedVehicleDetails.vehicle?.driver_phone ? `(${selectedVehicleDetails.vehicle?.driver_phone})` : ""}
+                                    Driver: <strong>{selectedVehicleDetails.vehicle?.driver_name || "Unassigned"}</strong> {selectedVehicleDetails.vehicle?.driver_phone ? `(${selectedVehicleDetails.vehicle?.driver_phone})` : ""} • Date: <strong>{selectedDate}</strong>
                                 </p>
                             </div>
                             <button

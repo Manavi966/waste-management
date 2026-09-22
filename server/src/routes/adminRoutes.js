@@ -445,4 +445,291 @@ router.post("/assign-collection-points", async (req, res) => {
     }
 });
 
+// ----------------------------------------------------
+// GET /api/admin/vehicle-assignments
+// Returns all vehicles with their assigned collection points grouped for a specific date
+// ----------------------------------------------------
+router.get("/vehicle-assignments", async (req, res) => {
+    try {
+        const { date } = req.query;
+        const dateStr = date || new Date().toISOString().split("T")[0];
+
+        const vehiclesRes = await pool.query(`
+            SELECT 
+                v.id AS vehicle_id,
+                v.vehicle_number,
+                v.status AS vehicle_status,
+                v.current_latitude,
+                v.current_longitude,
+                u.id AS driver_id,
+                u.name AS driver_name,
+                u.phone AS driver_phone,
+                r.id AS route_id,
+                r.route_date,
+                r.status AS route_status,
+                r.total_distance,
+                r.estimated_time
+            FROM vehicles v
+            LEFT JOIN users u ON v.driver_id = u.id
+            LEFT JOIN routes r ON r.vehicle_id = v.id AND r.route_date = $1::date
+            ORDER BY v.id ASC
+        `, [dateStr]);
+
+        const result = [];
+
+        for (const veh of vehiclesRes.rows) {
+            let stops = [];
+            if (veh.route_id) {
+                const stopsRes = await pool.query(`
+                    SELECT 
+                        rs.id AS route_stop_id,
+                        rs.sequence,
+                        rs.status AS stop_status,
+                        rs.expected_arrival,
+                        rs.actual_arrival,
+                        rs.actual_departure,
+                        rs.miss_reason,
+                        cp.id AS collection_point_id,
+                        cp.name,
+                        cp.address,
+                        cp.ward,
+                        cp.latitude,
+                        cp.longitude,
+                        cp.scheduled_time
+                    FROM route_stops rs
+                    JOIN collection_points cp ON rs.collection_point_id = cp.id
+                    WHERE rs.route_id = $1
+                    ORDER BY rs.sequence ASC, rs.id ASC
+                `, [veh.route_id]);
+                stops = stopsRes.rows;
+            }
+
+            result.push({
+                ...veh,
+                stops,
+                total_stops: stops.length,
+                pending_stops: stops.filter(s => s.stop_status === "PENDING"),
+                completed_stops: stops.filter(s => s.stop_status === "COMPLETED"),
+                missed_stops: stops.filter(s => s.stop_status === "MISSED")
+            });
+        }
+
+        res.json({
+            date: dateStr,
+            vehicles: result
+        });
+    } catch (error) {
+        console.error("Fetch vehicle assignments error:", error);
+        res.status(500).json({ message: "Failed to fetch vehicle assignments", error: error.message });
+    }
+});
+
+// ----------------------------------------------------
+// POST /api/admin/reassign-collection-points
+// Transactional reassignment of specific collection points from one vehicle to another
+// ----------------------------------------------------
+router.post("/reassign-collection-points", async (req, res) => {
+    const { optimizeAndSaveRoute } = require("./routeRoutes");
+    const client = await pool.connect();
+    try {
+        const {
+            source_vehicle_id,
+            destination_vehicle_id,
+            collection_point_ids,
+            route_date
+        } = req.body;
+
+        if (!source_vehicle_id || !destination_vehicle_id) {
+            return res.status(400).json({ message: "source_vehicle_id and destination_vehicle_id are required." });
+        }
+
+        if (source_vehicle_id.toString() === destination_vehicle_id.toString()) {
+            return res.status(400).json({ message: "Source and destination vehicles must be different." });
+        }
+
+        if (!Array.isArray(collection_point_ids) || collection_point_ids.length === 0) {
+            return res.status(400).json({ message: "Please select at least one collection point to reassign." });
+        }
+
+        const uniqueCpIds = [...new Set(collection_point_ids.map(Number))].filter(id => !isNaN(id) && id > 0);
+        if (uniqueCpIds.length === 0) {
+            return res.status(400).json({ message: "Invalid collection point IDs provided." });
+        }
+
+        const dateStr = route_date || new Date().toISOString().split("T")[0];
+
+        // 1. Validate Source Vehicle
+        const srcVehRes = await client.query(
+            `SELECT id, vehicle_number, status FROM vehicles WHERE id = $1`,
+            [source_vehicle_id]
+        );
+        if (srcVehRes.rows.length === 0) {
+            return res.status(404).json({ message: "Source vehicle not found." });
+        }
+        const srcVeh = srcVehRes.rows[0];
+
+        // 2. Validate Destination Vehicle
+        const destVehRes = await client.query(
+            `SELECT id, vehicle_number, status FROM vehicles WHERE id = $1`,
+            [destination_vehicle_id]
+        );
+        if (destVehRes.rows.length === 0) {
+            return res.status(404).json({ message: "Destination vehicle not found." });
+        }
+        const destVeh = destVehRes.rows[0];
+        const destStatus = (destVeh.status || "").toUpperCase();
+
+        if (destStatus === "MAINTENANCE" || destStatus === "INACTIVE") {
+            return res.status(400).json({
+                message: `Selected vehicle ${destVeh.vehicle_number} is under ${destVeh.status} and cannot receive collection points.`
+            });
+        }
+
+        await client.query("BEGIN");
+
+        // 3. Find Source Route for dateStr
+        const srcRouteRes = await client.query(
+            `SELECT id, status FROM routes WHERE vehicle_id = $1 AND route_date = $2::date`,
+            [source_vehicle_id, dateStr]
+        );
+        if (srcRouteRes.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ message: `No active route found for vehicle ${srcVeh.vehicle_number} on ${dateStr}.` });
+        }
+        const srcRouteId = srcRouteRes.rows[0].id;
+
+        // 4. Verify selected collection points belong to source route
+        const selectedStopsRes = await client.query(
+            `SELECT rs.id, rs.collection_point_id, rs.status, cp.name AS point_name
+             FROM route_stops rs
+             JOIN collection_points cp ON rs.collection_point_id = cp.id
+             WHERE rs.route_id = $1 AND rs.collection_point_id = ANY($2::int[])
+             FOR UPDATE OF rs`,
+            [srcRouteId, uniqueCpIds]
+        );
+
+        if (selectedStopsRes.rows.length !== uniqueCpIds.length) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({
+                message: "One or more selected collection points are not assigned to this vehicle."
+            });
+        }
+
+        // 5. Prevent completed collection points from being reassigned
+        const completedStops = selectedStopsRes.rows.filter(s => s.status === "COMPLETED");
+        if (completedStops.length > 0) {
+            await client.query("ROLLBACK");
+            const names = completedStops.map(s => s.point_name).join(", ");
+            return res.status(400).json({
+                message: `Completed collection points cannot be reassigned: ${names}`
+            });
+        }
+
+        // 6. Find or create destination route
+        let destRouteRes = await client.query(
+            `SELECT id FROM routes WHERE vehicle_id = $1 AND route_date = $2::date`,
+            [destination_vehicle_id, dateStr]
+        );
+        let destRouteId;
+        if (destRouteRes.rows.length === 0) {
+            const newRoute = await client.query(
+                `INSERT INTO routes (vehicle_id, route_date, status, total_distance, estimated_time)
+                 VALUES ($1, $2::date, 'PLANNED', 0.00, 0) RETURNING id`,
+                [destination_vehicle_id, dateStr]
+            );
+            destRouteId = newRoute.rows[0].id;
+        } else {
+            destRouteId = destRouteRes.rows[0].id;
+        }
+
+        // 7. Check if any selected point already exists on destination route (or another vehicle's route on that date)
+        const conflictRes = await client.query(
+            `SELECT rs.collection_point_id, cp.name, v.vehicle_number
+             FROM route_stops rs
+             JOIN routes r ON rs.route_id = r.id
+             JOIN vehicles v ON r.vehicle_id = v.id
+             JOIN collection_points cp ON rs.collection_point_id = cp.id
+             WHERE r.route_date = $1::date
+               AND r.id != $2
+               AND r.id != $3
+               AND rs.collection_point_id = ANY($4::int[])`,
+            [dateStr, srcRouteId, destRouteId, uniqueCpIds]
+        );
+
+        if (conflictRes.rows.length > 0) {
+            await client.query("ROLLBACK");
+            const conf = conflictRes.rows[0];
+            return res.status(409).json({
+                message: `Collection point "${conf.name}" is already assigned to vehicle ${conf.vehicle_number} for this date.`
+            });
+        }
+
+        // 8. Atomic move of route_stops to destination route
+        for (const stop of selectedStopsRes.rows) {
+            // Check if already present on dest route
+            const destStopCheck = await client.query(
+                `SELECT id FROM route_stops WHERE route_id = $1 AND collection_point_id = $2`,
+                [destRouteId, stop.collection_point_id]
+            );
+
+            if (destStopCheck.rows.length > 0) {
+                // Remove from source if already on destination
+                await client.query(`DELETE FROM route_stops WHERE id = $1`, [stop.id]);
+            } else {
+                // Move stop to destination route (set status to PENDING if reassigned)
+                await client.query(
+                    `UPDATE route_stops 
+                     SET route_id = $1, 
+                         status = 'PENDING',
+                         actual_arrival = NULL,
+                         actual_departure = NULL
+                     WHERE id = $2`,
+                    [destRouteId, stop.id]
+                );
+            }
+        }
+
+        // 9. Audit logging into activity_logs
+        const pointNames = selectedStopsRes.rows.map(s => s.point_name).join(", ");
+        await client.query(
+            `INSERT INTO activity_logs (event_type, description, vehicle_id)
+             VALUES ($1, $2, $3)`,
+            [
+                'POINTS_REASSIGNED',
+                `Reassigned ${uniqueCpIds.length} collection point(s) (${pointNames}) from ${srcVeh.vehicle_number} to ${destVeh.vehicle_number} for ${dateStr}.`,
+                destination_vehicle_id
+            ]
+        );
+
+        await client.query("COMMIT");
+
+        // 10. Re-optimize both routes
+        const srcOpt = await optimizeAndSaveRoute(srcRouteId, pool);
+        const destOpt = await optimizeAndSaveRoute(destRouteId, pool);
+
+        res.json({
+            message: `Successfully reassigned ${uniqueCpIds.length} collection point(s) from ${srcVeh.vehicle_number} to ${destVeh.vehicle_number}. Route sequences re-optimized.`,
+            reassigned_count: uniqueCpIds.length,
+            reassigned_points: selectedStopsRes.rows.map(s => ({ id: s.collection_point_id, name: s.point_name })),
+            source_vehicle: srcVeh.vehicle_number,
+            destination_vehicle: destVeh.vehicle_number,
+            destination_total_distance_km: destOpt.totalDistance,
+            destination_estimated_time_mins: destOpt.estimatedTotalMinutes,
+            source_total_distance_km: srcOpt.totalDistance,
+            source_estimated_time_mins: srcOpt.estimatedTotalMinutes
+        });
+
+    } catch (error) {
+        try {
+            await client.query("ROLLBACK");
+        } catch (rbErr) {
+            // ignore rollback error
+        }
+        console.error("Reassign collection points error:", error);
+        res.status(500).json({ message: "Failed to reassign collection points", error: error.message });
+    } finally {
+        client.release();
+    }
+});
+
 module.exports = router;

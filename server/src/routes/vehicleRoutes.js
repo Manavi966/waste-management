@@ -6,6 +6,7 @@ const router = express.Router();
 // Get all vehicles with driver details and status
 router.get("/", async (req, res) => {
     try {
+        const { date } = req.query;
         const result = await pool.query(
             `SELECT 
                 v.id,
@@ -15,11 +16,24 @@ router.get("/", async (req, res) => {
                 v.status,
                 v.current_latitude,
                 v.current_longitude,
-                (SELECT COUNT(*) FROM route_stops rs JOIN routes r ON rs.route_id = r.id WHERE r.vehicle_id = v.id AND r.route_date = CURRENT_DATE) AS assigned_stops,
-                (SELECT COUNT(*) FROM route_stops rs JOIN routes r ON rs.route_id = r.id WHERE r.vehicle_id = v.id AND r.route_date = CURRENT_DATE AND rs.status = 'COMPLETED') AS completed_stops
+                COALESCE(
+                    (SELECT COUNT(rs.id) 
+                     FROM route_stops rs 
+                     JOIN routes r ON rs.route_id = r.id 
+                     WHERE r.vehicle_id = v.id AND r.route_date = COALESCE($1::date, CURRENT_DATE)),
+                    0
+                ) AS assigned_stops,
+                COALESCE(
+                    (SELECT COUNT(rs.id) 
+                     FROM route_stops rs 
+                     JOIN routes r ON rs.route_id = r.id 
+                     WHERE r.vehicle_id = v.id AND r.route_date = COALESCE($1::date, CURRENT_DATE) AND rs.status = 'COMPLETED'),
+                    0
+                ) AS completed_stops
              FROM vehicles v
              LEFT JOIN users u ON v.driver_id = u.id
-             ORDER BY v.id ASC`
+             ORDER BY v.id ASC`,
+            [date || null]
         );
 
         res.json(result.rows);
@@ -67,16 +81,21 @@ router.get("/:id/details", async (req, res) => {
             const stopsRes = await pool.query(
                 `SELECT 
                     rs.id AS stop_id,
+                    rs.id AS route_stop_id,
                     rs.sequence,
                     rs.status AS stop_status,
+                    rs.status,
                     rs.expected_arrival,
                     rs.actual_arrival,
                     rs.actual_departure,
                     rs.miss_reason,
                     cp.id AS collection_point_id,
                     cp.name AS point_name,
+                    cp.name,
                     cp.address,
                     cp.ward,
+                    cp.latitude,
+                    cp.longitude,
                     cp.scheduled_time
                  FROM route_stops rs
                  JOIN collection_points cp ON rs.collection_point_id = cp.id
@@ -87,9 +106,9 @@ router.get("/:id/details", async (req, res) => {
             stops = stopsRes.rows;
         }
 
-        const completedStops = stops.filter(s => s.stop_status === 'COMPLETED');
-        const pendingStops = stops.filter(s => s.stop_status === 'PENDING');
-        const missedStops = stops.filter(s => s.stop_status === 'MISSED');
+        const completedStops = stops.filter(s => s.stop_status === 'COMPLETED' || s.status === 'COMPLETED');
+        const pendingStops = stops.filter(s => s.stop_status === 'PENDING' || s.status === 'PENDING');
+        const missedStops = stops.filter(s => s.stop_status === 'MISSED' || s.status === 'MISSED');
 
         res.json({
             vehicle: vehicleInfo,

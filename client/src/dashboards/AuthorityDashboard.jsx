@@ -9,13 +9,21 @@ import ComplaintsPage from "./ComplaintsPage";
 function AuthorityDashboard({ user, onLogout }) {
     const [activeTab, setActiveTab] = useState("dashboard");
     const [selectedVehicleId, setSelectedVehicleId] = useState(null);
+    const [selectedDate, setSelectedDateState] = useState(() => {
+        return localStorage.getItem("authority_operation_date") || "2026-09-20";
+    });
     const [dashboard, setDashboard] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
 
+    const setSelectedDate = (newDate) => {
+        setSelectedDateState(newDate);
+        localStorage.setItem("authority_operation_date", newDate);
+    };
+
     const fetchDashboard = async () => {
         try {
-            const response = await api.get("/admin/dashboard");
+            const response = await api.get(`/admin/dashboard?date=${selectedDate}`);
             setDashboard(response.data);
             setError("");
         } catch (err) {
@@ -28,7 +36,7 @@ function AuthorityDashboard({ user, onLogout }) {
 
     useEffect(() => {
         fetchDashboard();
-    }, []);
+    }, [selectedDate]);
 
     const handleManageVehicle = (vehicleId) => {
         setSelectedVehicleId(vehicleId);
@@ -40,12 +48,19 @@ function AuthorityDashboard({ user, onLogout }) {
             case "vehicles":
                 return (
                     <VehiclesPage
+                        selectedDate={selectedDate}
+                        setSelectedDate={setSelectedDate}
                         initialVehicleId={selectedVehicleId}
                         onClearInitialVehicle={() => setSelectedVehicleId(null)}
                     />
                 );
             case "assign-vehicle":
-                return <AssignVehiclePage />;
+                return (
+                    <AssignVehiclePage
+                        selectedDate={selectedDate}
+                        setSelectedDate={setSelectedDate}
+                    />
+                );
             case "complaints":
                 return <ComplaintsPage />;
             case "dashboard":
@@ -173,11 +188,12 @@ function AuthorityDashboard({ user, onLogout }) {
                                             <td style={{ padding: "10px 12px", color: "#334155" }}>{v.driver_name || "Unassigned"}</td>
                                             <td style={{ padding: "10px 12px" }}>
                                                 <span style={{
-                                                    padding: "2px 8px", borderRadius: "10px", fontSize: "11px", fontWeight: "600",
-                                                    backgroundColor: v.vehicle_status === "ON_ROUTE" ? "#dbeafe" : v.vehicle_status === "MAINTENANCE" ? "#fee2e2" : "#dcfce7",
-                                                    color: v.vehicle_status === "ON_ROUTE" ? "#1d4ed8" : v.vehicle_status === "MAINTENANCE" ? "#b91c1c" : "#15803d"
+                                                    padding: "3px 10px", borderRadius: "12px", fontSize: "11px", fontWeight: "700",
+                                                    backgroundColor: (v.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#fee2e2" : "#dcfce7",
+                                                    color: (v.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#b91c1c" : "#15803d",
+                                                    border: `1px solid ${(v.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#fca5a5" : "#bbf7d0"}`
                                                 }}>
-                                                    {v.vehicle_status || "In Service"}
+                                                    {(v.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "🔧 MAINTENANCE" : "🟢 IN SERVICE"}
                                                 </span>
                                             </td>
                                             <td style={{ padding: "10px 12px", color: "#334155" }}>{v.assigned || 0} stops</td>
