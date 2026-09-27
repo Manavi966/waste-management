@@ -4,7 +4,11 @@ require("dotenv").config();
 
 const pool = require("./config/db");
 const initAssignmentIntegrity = require("./config/initTrigger");
-initAssignmentIntegrity();
+const initDatabase = require("./config/initDb");
+
+initDatabase().then(() => {
+    initAssignmentIntegrity();
+});
 
 const authRoutes = require("./routes/authRoutes");
 const vehicleRoutes = require("./routes/vehicleRoutes");

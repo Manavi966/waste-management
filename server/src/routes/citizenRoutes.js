@@ -1,6 +1,7 @@
 const express = require("express");
 const pool = require("../config/db");
 const { calculateHaversineDistance } = require("../services/trafficService");
+const { syncDailyRoutesForDate, getEffectiveAssignmentForWard } = require("../services/dailyOperationService");
 
 const router = express.Router();
 
@@ -34,13 +35,15 @@ function parseScheduledTimeToDate(timeStr, dateStr) {
 
 // ----------------------------------------------------
 // GET /api/citizen/collection-status
-// Location-based waste collection tracking for citizens
+// Location-based waste collection tracking for citizens with permanent area & replacement support
 // ----------------------------------------------------
 router.get("/collection-status", async (req, res) => {
     try {
         const { latitude, longitude, collection_point_id, date } = req.query;
-
         const dateStr = date || new Date().toISOString().split("T")[0];
+
+        // 0. Auto-sync routes from permanent & temporary assignments
+        await syncDailyRoutesForDate(dateStr);
 
         let targetPoint = null;
         let distanceFromCitizen = null;
@@ -106,8 +109,7 @@ router.get("/collection-status", async (req, res) => {
                 }
             }
 
-            // Max search radius: 30 km
-            if (minDistance > 30) {
+            if (minDistance > 35) {
                 return res.json({
                     found: false,
                     message: "No collection point found near your location."
@@ -123,7 +125,60 @@ router.get("/collection-status", async (req, res) => {
             });
         }
 
-        // STEP 2: Find assigned vehicle for targetPoint on dateStr
+        const pointInfo = {
+            id: targetPoint.id,
+            name: targetPoint.name,
+            address: targetPoint.address,
+            ward: targetPoint.ward,
+            latitude: Number(targetPoint.latitude),
+            longitude: Number(targetPoint.longitude),
+            scheduledTime: targetPoint.scheduled_time ? targetPoint.scheduled_time.toString() : "09:00 AM",
+            distanceFromCitizen: distanceFromCitizen !== null ? Number(distanceFromCitizen.toFixed(2)) : null
+        };
+
+        // STEP 2: Check ward assignment status (Permanent vs Maintenance vs Temporary Replacement)
+        const effectiveAssign = await getEffectiveAssignmentForWard(targetPoint.ward, dateStr);
+
+        // Case 1: Permanent vehicle is in MAINTENANCE and NO replacement assigned
+        if (effectiveAssign.is_maintenance && !effectiveAssign.has_replacement) {
+            const permVeh = effectiveAssign.permanent_vehicle;
+            return res.json({
+                found: true,
+                collectionPoint: pointInfo,
+                collection_point: pointInfo,
+                is_maintenance: true,
+                replacement_assigned: false,
+                maintenance_message: "Your area's waste collection vehicle is currently under maintenance and will not be able to collect waste today. Please check the app for further updates.",
+                vehicle: permVeh ? {
+                    id: permVeh.vehicle_id,
+                    vehicleNumber: permVeh.vehicle_number,
+                    vehicle_number: permVeh.vehicle_number,
+                    status: "MAINTENANCE",
+                    permanent_ward: targetPoint.ward
+                } : null,
+                driver: permVeh ? {
+                    id: permVeh.driver_id || null,
+                    name: permVeh.driver_name || "Unassigned",
+                    phone: permVeh.driver_phone || null
+                } : null,
+                route: null,
+                collection: {
+                    status: "NOT_AVAILABLE",
+                    expectedArrival: null
+                },
+                tracking: null,
+                gps: null,
+                delay: {
+                    isDelayed: false,
+                    minutes: 0,
+                    statusText: "🛠️ Vehicle Under Maintenance",
+                    statusTone: "MAINTENANCE"
+                },
+                message: "Your area's waste collection vehicle is currently under maintenance and will not be able to collect waste today. Please check the app for further updates."
+            });
+        }
+
+        // STEP 3: Find active route_stop for this collection point on dateStr
         const assignmentRes = await pool.query(
             `SELECT 
                 rs.id AS route_stop_id,
@@ -157,19 +212,41 @@ router.get("/collection-status", async (req, res) => {
             [targetPoint.id, dateStr]
         );
 
-        const pointInfo = {
-            id: targetPoint.id,
-            name: targetPoint.name,
-            address: targetPoint.address,
-            ward: targetPoint.ward,
-            latitude: Number(targetPoint.latitude),
-            longitude: Number(targetPoint.longitude),
-            scheduledTime: targetPoint.scheduled_time ? targetPoint.scheduled_time.toString() : "09:00 AM",
-            distanceFromCitizen: distanceFromCitizen !== null ? Number(distanceFromCitizen.toFixed(2)) : null
-        };
-
-        // Edge case: No vehicle assignment for this point on this date
+        // Fallback if no specific stop found in route_stops
         if (assignmentRes.rows.length === 0) {
+            const operatingVeh = effectiveAssign.effective_vehicle;
+            if (operatingVeh) {
+                return res.json({
+                    found: true,
+                    collectionPoint: pointInfo,
+                    collection_point: pointInfo,
+                    vehicle: {
+                        id: operatingVeh.vehicle_id,
+                        vehicleNumber: operatingVeh.vehicle_number,
+                        vehicle_number: operatingVeh.vehicle_number,
+                        status: operatingVeh.vehicle_status || "IN_SERVICE"
+                    },
+                    driver: {
+                        id: operatingVeh.driver_id || null,
+                        name: operatingVeh.driver_name || "Unassigned",
+                        phone: operatingVeh.driver_phone || null
+                    },
+                    route: null,
+                    collection: {
+                        status: "PENDING",
+                        expectedArrival: targetPoint.scheduled_time || "09:00 AM"
+                    },
+                    tracking: null,
+                    gps: null,
+                    delay: {
+                        isDelayed: false,
+                        minutes: 0,
+                        statusText: "🟢 Scheduled for Collection",
+                        statusTone: "ON_SCHEDULE"
+                    }
+                });
+            }
+
             return res.json({
                 found: true,
                 collectionPoint: pointInfo,
@@ -186,9 +263,7 @@ router.get("/collection-status", async (req, res) => {
         }
 
         const assign = assignmentRes.rows[0];
-
-        // Edge case: Vehicle under maintenance
-        const isMaintenance = (assign.vehicle_status || "").toUpperCase() === "MAINTENANCE";
+        const isTemporaryReplacement = effectiveAssign.is_maintenance && effectiveAssign.has_replacement;
 
         // STEP 4: Live GPS Location for the assigned vehicle
         let gpsData = null;
@@ -243,14 +318,13 @@ router.get("/collection-status", async (req, res) => {
             };
         }
 
-        // STEP 6: Delay Detection & Status Evaluation
+        // STEP 5: Status Evaluation & Delay Detection
         const now = new Date();
         let isDelayed = false;
         let delayMinutes = 0;
         let statusText = "🟢 On Time";
-        let statusTone = "ON_SCHEDULE"; // ON_SCHEDULE, DELAYED, NOT_STARTED, COMPLETED, MISSED, MAINTENANCE
+        let statusTone = "ON_SCHEDULE";
 
-        // Format expected arrival string
         let formattedExpectedArrival = null;
         if (assign.expected_arrival) {
             formattedExpectedArrival = new Date(assign.expected_arrival).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -258,20 +332,16 @@ router.get("/collection-status", async (req, res) => {
             formattedExpectedArrival = targetPoint.scheduled_time.toString();
         }
 
-        if (isMaintenance) {
-            statusText = "🛠️ Vehicle currently unavailable (Under Maintenance)";
-            statusTone = "MAINTENANCE";
-        } else if (assign.collection_status === "COMPLETED") {
+        if (assign.collection_status === "COMPLETED") {
             statusText = "🟢 Collection Completed";
             statusTone = "COMPLETED";
         } else if (assign.collection_status === "MISSED") {
             statusText = `🔴 Collection Missed${assign.miss_reason ? ` (${assign.miss_reason})` : ""}`;
             statusTone = "MISSED";
         } else if (assign.route_status === "PLANNED") {
-            statusText = "🔵 Route Not Started Yet";
+            statusText = "🔵 Route Scheduled / Not Started Yet";
             statusTone = "NOT_STARTED";
         } else {
-            // Collection is PENDING and Route is IN_PROGRESS: Check expected arrival / scheduled time
             let targetArrival = null;
             if (assign.expected_arrival) {
                 targetArrival = new Date(assign.expected_arrival);
@@ -281,7 +351,7 @@ router.get("/collection-status", async (req, res) => {
 
             if (targetArrival && !isNaN(targetArrival.getTime())) {
                 const diffMs = now.getTime() - targetArrival.getTime();
-                if (diffMs > 5 * 60000) { // Delayed by more than 5 minutes
+                if (diffMs > 5 * 60000) {
                     isDelayed = true;
                     delayMinutes = Math.round(diffMs / 60000);
                     statusText = `🟡 Vehicle Delayed (by ${delayMinutes} minutes)`;
@@ -301,7 +371,9 @@ router.get("/collection-status", async (req, res) => {
             id: assign.vehicle_id,
             vehicleNumber: assign.vehicle_number,
             vehicle_number: assign.vehicle_number,
-            status: isMaintenance ? "MAINTENANCE" : (assign.vehicle_status || "IN_SERVICE")
+            status: assign.vehicle_status || "IN_SERVICE",
+            is_replacement: isTemporaryReplacement,
+            regular_vehicle_number: effectiveAssign.permanent_vehicle?.vehicle_number || null
         };
 
         const driverInfo = {
@@ -310,10 +382,26 @@ router.get("/collection-status", async (req, res) => {
             phone: assign.driver_phone && assign.driver_phone.trim() !== "" ? assign.driver_phone : null
         };
 
+        // Fetch verified scan count for this collection zone
+        const checkpointCountRes = await pool.query(
+            `SELECT COUNT(sc.id) AS total, COUNT(sr.id) AS scanned
+             FROM scanner_checkpoints sc
+             LEFT JOIN scanner_scan_records sr 
+               ON sc.id = sr.scanner_id AND sr.route_stop_id = $1 AND sr.verification_status = 'VERIFIED'
+             WHERE sc.collection_point_id = $2`,
+            [assign.route_stop_id, targetPoint.id]
+        );
+        const totalScanners = Number(checkpointCountRes.rows[0]?.total) || 3;
+        const scannedCount = Number(checkpointCountRes.rows[0]?.scanned) || 0;
+
         const collectionInfo = {
             routeStopId: assign.route_stop_id,
             sequence: assign.sequence,
             status: assign.collection_status,
+            zone_status: assign.collection_status,
+            scanned_count: scannedCount,
+            total_scanners: totalScanners,
+            checkpoint_progress: `${scannedCount}/${totalScanners}`,
             expectedArrival: formattedExpectedArrival,
             actualArrival: assign.actual_arrival ? new Date(assign.actual_arrival).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : null,
             actualDeparture: assign.actual_departure ? new Date(assign.actual_departure).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : null,
@@ -343,7 +431,13 @@ router.get("/collection-status", async (req, res) => {
             collection: collectionInfo,
             tracking: gpsData,
             gps: gpsData,
-            delay: delayInfo
+            delay: delayInfo,
+            is_maintenance: false,
+            is_replacement: isTemporaryReplacement,
+            replacement_assigned: isTemporaryReplacement,
+            replacement_banner: isTemporaryReplacement
+                ? "Your regular collection vehicle is under maintenance. A replacement vehicle has been assigned for today's collection."
+                : null
         });
 
     } catch (error) {
@@ -352,6 +446,31 @@ router.get("/collection-status", async (req, res) => {
             found: false,
             message: "Failed to fetch collection status."
         });
+    }
+});
+
+// GET /api/citizen/notifications - Get notifications for citizen's ward
+router.get("/notifications", async (req, res) => {
+    try {
+        const { ward } = req.query;
+        let query = `
+            SELECT * FROM notifications
+            WHERE recipient_role IN ('CITIZEN', 'ALL')
+        `;
+        const params = [];
+
+        if (ward) {
+            params.push(ward);
+            query += ` AND (ward = $1 OR ward IS NULL)`;
+        }
+
+        query += ` ORDER BY id DESC LIMIT 20`;
+
+        const result = await pool.query(query, params);
+        res.json(result.rows);
+    } catch (error) {
+        console.error("Fetch citizen notifications error:", error);
+        res.status(500).json({ message: "Failed to fetch notifications" });
     }
 });
 

@@ -3,6 +3,7 @@ import React from "react";
 function Sidebar({ activeTab, setActiveTab, role, onLogout }) {
     const authorityItems = [
         { id: "dashboard", label: "Dashboard", icon: "📊" },
+        { id: "verification", label: "Collection Verification", icon: "✅" },
         { id: "vehicles", label: "Vehicles", icon: "🚛" },
         { id: "assign-vehicle", label: "Assign Collection Points", icon: "📋" },
         { id: "complaints", label: "Complaints", icon: "💬" }

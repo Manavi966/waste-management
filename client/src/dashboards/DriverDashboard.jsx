@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import api from "../services/api";
 import Navbar from "../components/Navbar";
+import CheckpointQRScannerModal from "../components/CheckpointQRScannerModal";
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
@@ -34,6 +35,14 @@ function formatDistance(meters) {
         return `${Math.round(meters)} m`;
     }
     return `${(meters / 1000).toFixed(2)} km`;
+}
+
+// Format seconds into MM:SS
+function formatSeconds(sec) {
+    const s = Math.max(0, Math.floor(sec || 0));
+    const mins = Math.floor(s / 60);
+    const remSec = s % 60;
+    return `${mins.toString().padStart(2, "0")}:${remSec.toString().padStart(2, "0")}`;
 }
 
 // Map Controller for custom map buttons ("My Location" & "Fit Route")
@@ -82,7 +91,7 @@ function MapController({ vehicleLocation, stops, actionTrigger }) {
     return null;
 }
 
-// Custom vehicle "You are here" marker
+// Custom vehicle marker
 const createVehicleMarker = (vehicleNumber) => {
     return L.divIcon({
         className: "custom-driver-vehicle-marker",
@@ -166,14 +175,23 @@ function DriverDashboard({ user, onLogout }) {
     const [gpsTrackingActive, setGpsTrackingActive] = useState(false);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
-    const [updatingStop, setUpdatingStop] = useState(null);
+    const [actionLoading, setActionLoading] = useState(false);
+    
+    // QR Scanner modal state
+    const [qrScannerOpen, setQrScannerOpen] = useState(false);
+
+    // Miss modal state
     const [missModalStopId, setMissModalStopId] = useState(null);
     const [missReason, setMissReason] = useState("Heavy Traffic");
+
+    // Live elapsed timer state (updates every second)
+    const [liveDwellSeconds, setLiveDwellSeconds] = useState(0);
 
     // Action trigger for MapController
     const [mapAction, setMapAction] = useState(null);
 
     const pollingRef = useRef(null);
+    const timerRef = useRef(null);
     const watchIdRef = useRef(null);
 
     // Fetch driver route from backend
@@ -189,6 +207,14 @@ function DriverDashboard({ user, onLogout }) {
             setNextStop(data.next_stop || null);
             setSummary(data.summary || { total_stops: 0, completed_count: 0, pending_count: 0, missed_count: 0, progress_percent: 0 });
             setGps(data.gps || null);
+
+            // Synchronize live timer with nextStop dwell start time
+            if (data.next_stop?.dwell_start_time && data.next_stop?.status !== "COMPLETED") {
+                const elapsed = Math.max(0, Math.floor((Date.now() - new Date(data.next_stop.dwell_start_time).getTime()) / 1000));
+                setLiveDwellSeconds(elapsed);
+            } else if (!data.next_stop?.dwell_start_time) {
+                setLiveDwellSeconds(0);
+            }
         } catch (err) {
             console.error("Failed to load driver route:", err);
             setError("Failed to load driver route information.");
@@ -201,12 +227,28 @@ function DriverDashboard({ user, onLogout }) {
         fetchDriverRoute(selectedDate);
     }, [user.id, selectedDate]);
 
-    // Periodically poll for GPS updates and route changes every 6 seconds
+    // Live 1-second interval timer for dwell duration
+    useEffect(() => {
+        if (timerRef.current) clearInterval(timerRef.current);
+
+        timerRef.current = setInterval(() => {
+            if (nextStop?.dwell_start_time && nextStop.status !== "COMPLETED") {
+                const elapsed = Math.max(0, Math.floor((Date.now() - new Date(nextStop.dwell_start_time).getTime()) / 1000));
+                setLiveDwellSeconds(elapsed);
+            }
+        }, 1000);
+
+        return () => {
+            if (timerRef.current) clearInterval(timerRef.current);
+        };
+    }, [nextStop?.dwell_start_time, nextStop?.status]);
+
+    // Periodically poll for GPS updates and route changes every 5 seconds
     useEffect(() => {
         if (pollingRef.current) clearInterval(pollingRef.current);
         pollingRef.current = setInterval(() => {
             fetchDriverRoute(selectedDate);
-        }, 6000);
+        }, 5000);
 
         return () => {
             if (pollingRef.current) clearInterval(pollingRef.current);
@@ -297,59 +339,22 @@ function DriverDashboard({ user, onLogout }) {
         ? calculateDistanceMeters(vehiclePosition.latitude, vehiclePosition.longitude, Number(nextStopCp.latitude), Number(nextStopCp.longitude))
         : null;
 
-    const isInsideGeofence = distanceToNextMeters !== null && distanceToNextMeters <= 100;
+    const geofenceRadius = nextStopCp?.geofence_radius_meters || 100;
+    const isInsideGeofence = distanceToNextMeters !== null && distanceToNextMeters <= geofenceRadius;
 
-    // Complete collection stop with double geofence check
-    const completeStop = async (stopId, stopLat, stopLng) => {
-        try {
-            setUpdatingStop(stopId);
-
-            const performCompletion = async (lat, lon, acc) => {
-                try {
-                    const response = await api.post(`/routes/stops/${stopId}/complete`, {
-                        latitude: lat,
-                        longitude: lon,
-                        accuracy: acc || gpsAccuracy,
-                        driver_id: user.id
-                    });
-                    alert(`✓ ${response.data.message || "Collection marked as completed!"}`);
-                    await fetchDriverRoute(selectedDate);
-                } catch (err) {
-                    const msg = err.response?.data?.message || "Unable to complete collection point.";
-                    alert(`⚠️ ${msg}`);
-                } finally {
-                    setUpdatingStop(null);
-                }
-            };
-
-            if (navigator.geolocation) {
-                navigator.geolocation.getCurrentPosition(
-                    (pos) => performCompletion(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy),
-                    () => {
-                        if (vehiclePosition) {
-                            performCompletion(vehiclePosition.latitude, vehiclePosition.longitude, null);
-                        } else {
-                            performCompletion(Number(stopLat), Number(stopLng), null);
-                        }
-                    },
-                    { enableHighAccuracy: true, timeout: 5000 }
-                );
-            } else if (vehiclePosition) {
-                performCompletion(vehiclePosition.latitude, vehiclePosition.longitude, null);
-            } else {
-                performCompletion(Number(stopLat), Number(stopLng), null);
-            }
-        } catch (err) {
-            console.error("Stop completion error:", err);
-            setUpdatingStop(null);
-        }
-    };
+    // Checkpoint & Dwell verification metrics
+    const minCollectionSec = Number(nextStopCp?.minimum_collection_time_seconds) || 30;
+    const isDwellMet = liveDwellSeconds >= minCollectionSec;
+    const totalScanners = nextStop?.total_scanners || (nextStop?.checkpoints?.length) || 3;
+    const scannedCount = nextStop?.scanned_count || (nextStop?.checkpoints?.filter(c => c.is_scanned).length) || 0;
+    const allScannersScanned = scannedCount >= totalScanners && totalScanners > 0;
+    const nextPendingCheckpoint = (nextStop?.checkpoints || []).find(c => !c.is_scanned);
 
     // Report stop as missed
     const handleConfirmMiss = async () => {
         if (!missModalStopId) return;
         try {
-            setUpdatingStop(missModalStopId);
+            setActionLoading(true);
             const response = await api.post(`/routes/stops/${missModalStopId}/miss`, { reason: missReason });
             alert(`⚠️ ${response.data.message || "Location marked as missed."}`);
             setMissModalStopId(null);
@@ -357,7 +362,7 @@ function DriverDashboard({ user, onLogout }) {
         } catch (err) {
             alert(err.response?.data?.message || "Failed to mark stop as missed.");
         } finally {
-            setUpdatingStop(null);
+            setActionLoading(false);
         }
     };
 
@@ -366,7 +371,7 @@ function DriverDashboard({ user, onLogout }) {
             <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", color: "#f8fafc", fontFamily: "'Inter', sans-serif" }}>
                 <Navbar user={user} onLogout={onLogout} />
                 <div style={{ padding: "40px", textAlign: "center", color: "#94a3b8" }}>
-                    Loading Driver Navigation Dashboard...
+                    Loading Driver Verification & Navigation Dashboard...
                 </div>
             </div>
         );
@@ -396,7 +401,7 @@ function DriverDashboard({ user, onLogout }) {
             return (
                 <span style={{ color: "#34d399", fontWeight: "700", display: "flex", alignItems: "center", gap: "6px" }}>
                     <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#34d399", animation: "pulse 1.5s infinite" }}></span>
-                    ● Live GPS Tracking Active
+                    ● Live GPS Broadcasting
                 </span>
             );
         }
@@ -407,14 +412,14 @@ function DriverDashboard({ user, onLogout }) {
             }
             return <span style={{ color: "#f87171" }}>⚠️ GPS signal may be outdated ({mins}m ago)</span>;
         }
-        return <span style={{ color: "#94a3b8" }}>GPS not started</span>;
+        return <span style={{ color: "#94a3b8" }}>GPS not broadcasting</span>;
     };
 
     return (
         <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", color: "#f8fafc", fontFamily: "'Inter', sans-serif" }}>
             <Navbar user={user} onLogout={onLogout} />
 
-            <main style={{ padding: "16px", maxWidth: "1250px", margin: "0 auto" }}>
+            <main style={{ padding: "16px", maxWidth: "1350px", margin: "0 auto" }}>
                 {/* TOP HEADER BAR */}
                 <div style={{
                     display: "flex",
@@ -428,16 +433,29 @@ function DriverDashboard({ user, onLogout }) {
                     borderRadius: "12px",
                     border: "1px solid #334155"
                 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                        <span style={{ fontSize: "28px" }}>🚛</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+                        <div style={{ fontSize: "32px", backgroundColor: "#0f172a", padding: "8px", borderRadius: "10px", border: "1px solid #334155" }}>
+                            🚛
+                        </div>
                         <div>
                             <div style={{ fontSize: "11px", textTransform: "uppercase", color: "#94a3b8", fontWeight: "700", letterSpacing: "0.5px" }}>
-                                Navigation Mode • Driver Portal
+                                Driver Portal • Checkpoint Verification
                             </div>
-                            <div style={{ fontSize: "20px", fontWeight: "800", color: "#34d399" }}>
-                                {vehicle ? vehicle.vehicle_number : "No Vehicle Assigned"}
-                                <span style={{ fontSize: "14px", fontWeight: "600", color: "#94a3b8", marginLeft: "8px" }}>
-                                    ({user?.name || "Driver"})
+                            <div style={{ fontSize: "20px", fontWeight: "800", color: "#34d399", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                                <span>{vehicle ? vehicle.vehicle_number : "No Vehicle Assigned"}</span>
+                                <span style={{ fontSize: "13px", fontWeight: "800", backgroundColor: "#065f46", color: "#6ee7b7", padding: "3px 10px", borderRadius: "6px", border: "1px solid #059669" }}>
+                                    Permanent Assigned Area: {vehicle?.permanent_ward || "Not Assigned"}
+                                </span>
+                                <span style={{ fontSize: "12px", fontWeight: "800", backgroundColor: "#1e3a8a", color: "#93c5fd", padding: "3px 8px", borderRadius: "6px" }}>
+                                    Status: {vehicle?.status || "ACTIVE"}
+                                </span>
+                                {vehicle?.temporary_ward && (
+                                    <span style={{ fontSize: "12px", fontWeight: "800", backgroundColor: "#78350f", color: "#fde68a", padding: "3px 8px", borderRadius: "6px" }}>
+                                        ⚡ Covering Today: {vehicle.temporary_ward}
+                                    </span>
+                                )}
+                                <span style={{ fontSize: "13px", fontWeight: "600", color: "#94a3b8" }}>
+                                    • Driver: {user?.name || "Ramesh Kumar"}
                                 </span>
                             </div>
                         </div>
@@ -488,7 +506,7 @@ function DriverDashboard({ user, onLogout }) {
                                 boxShadow: "0 2px 6px rgba(0,0,0,0.3)"
                             }}
                         >
-                            <span>{gpsTrackingActive ? "● GPS Broadcasting" : "🚀 Start GPS"}</span>
+                            <span>{gpsTrackingActive ? "● Broadcasting" : "🚀 Start GPS"}</span>
                         </button>
                     </div>
                 </div>
@@ -499,99 +517,311 @@ function DriverDashboard({ user, onLogout }) {
                     </div>
                 )}
 
-                {/* GOOGLE-MAPS-LIKE NEXT STOP CARD */}
+                {/* CURRENT COLLECTION ZONE SECTION */}
                 {nextStop ? (
                     <div style={{
-                        backgroundColor: isInsideGeofence ? "#065f46" : "#1e293b",
-                        border: isInsideGeofence ? "2px solid #34d399" : "2px solid #0284c7",
-                        borderRadius: "14px",
-                        padding: "16px 20px",
-                        marginBottom: "16px",
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        flexWrap: "wrap",
-                        gap: "16px",
-                        boxShadow: isInsideGeofence ? "0 4px 15px rgba(52,211,153,0.3)" : "0 4px 12px rgba(2,132,199,0.25)"
+                        backgroundColor: "#1e293b",
+                        border: isInsideGeofence ? "2px solid #10b981" : "2px solid #0284c7",
+                        borderRadius: "16px",
+                        padding: "20px 24px",
+                        marginBottom: "20px",
+                        boxShadow: isInsideGeofence ? "0 4px 20px rgba(16,185,129,0.2)" : "0 4px 15px rgba(2,132,199,0.15)"
                     }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
-                            <div style={{
-                                width: "48px",
-                                height: "48px",
-                                borderRadius: "50%",
-                                backgroundColor: isInsideGeofence ? "#34d399" : "#0284c7",
-                                color: isInsideGeofence ? "#064e3b" : "#ffffff",
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                fontWeight: "900",
-                                fontSize: "20px"
-                            }}>
-                                {nextStop.sequence}
-                            </div>
-                            <div>
-                                <div style={{ fontSize: "12px", color: isInsideGeofence ? "#a7f3d0" : "#7dd3fc", textTransform: "uppercase", fontWeight: "800", letterSpacing: "0.5px" }}>
-                                    {isInsideGeofence ? "🟢 GEOFENCE REACHED • STOP READY" : `NEXT COLLECTION POINT • STOP ${nextStop.sequence} OF ${summary.total_stops}`}
+                        {/* Zone Header Bar */}
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "16px", borderBottom: "1px solid #334155", paddingBottom: "16px", marginBottom: "18px" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+                                <div style={{
+                                    width: "48px",
+                                    height: "48px",
+                                    borderRadius: "12px",
+                                    backgroundColor: isInsideGeofence ? "#10b981" : "#0284c7",
+                                    color: isInsideGeofence ? "#064e3b" : "#ffffff",
+                                    display: "flex",
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    fontWeight: "900",
+                                    fontSize: "20px"
+                                }}>
+                                    #{nextStop.sequence}
                                 </div>
-                                <div style={{ fontSize: "22px", fontWeight: "900", color: "#ffffff", marginTop: "2px" }}>
-                                    📍 {nextStopCp?.name}
-                                </div>
-                                <div style={{ fontSize: "13px", color: isInsideGeofence ? "#d1fae5" : "#cbd5e1", marginTop: "2px" }}>
-                                    {nextStopCp?.ward} • {nextStopCp?.address} • Scheduled: {nextStopCp?.scheduled_time || "09:00 AM"}
-                                </div>
-                                {isInsideGeofence && (
-                                    <div style={{ fontSize: "13px", color: "#a7f3d0", fontWeight: "700", marginTop: "4px" }}>
-                                        🟢 You have reached {nextStopCp?.name} (Within 100m geofence)
+                                <div>
+                                    <div style={{ fontSize: "11px", color: isInsideGeofence ? "#34d399" : "#38bdf8", textTransform: "uppercase", fontWeight: "800", letterSpacing: "0.5px" }}>
+                                        {isInsideGeofence ? "🟢 GEOFENCE REACHED • COLLECTION ZONE ACTIVE" : `CURRENT COLLECTION ZONE • STOP ${nextStop.sequence} OF ${summary.total_stops}`}
                                     </div>
-                                )}
+                                    <div style={{ fontSize: "22px", fontWeight: "900", color: "#ffffff", marginTop: "2px" }}>
+                                        📍 {nextStopCp?.name}
+                                    </div>
+                                    <div style={{ fontSize: "13px", color: "#94a3b8", marginTop: "2px" }}>
+                                        {nextStopCp?.ward} • {nextStopCp?.address} • Scheduled: {nextStopCp?.scheduled_time || "09:00 AM"}
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Distance & Geofence Status */}
+                            <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+                                <div style={{ textAlign: "right" }}>
+                                    <div style={{ fontSize: "11px", color: "#94a3b8", fontWeight: "700", textTransform: "uppercase" }}>
+                                        Distance to Zone
+                                    </div>
+                                    <div style={{ fontSize: "20px", fontWeight: "900", color: isInsideGeofence ? "#34d399" : "#38bdf8" }}>
+                                        {formatDistance(distanceToNextMeters)}
+                                    </div>
+                                    <div style={{ fontSize: "11px", color: isInsideGeofence ? "#34d399" : "#94a3b8", fontWeight: "600" }}>
+                                        {isInsideGeofence ? "✓ Inside 100m Geofence" : `Geofence: ${geofenceRadius}m`}
+                                    </div>
+                                </div>
                             </div>
                         </div>
 
-                        <div style={{ display: "flex", alignItems: "center", gap: "20px" }}>
-                            <div style={{ textAlign: "right" }}>
-                                <div style={{ fontSize: "11px", color: isInsideGeofence ? "#a7f3d0" : "#94a3b8", fontWeight: "700", textTransform: "uppercase" }}>
-                                    Distance to Point
+                        {/* 4-SECTION COMPACT GRID AS REQUESTED */}
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "16px", marginBottom: "18px" }}>
+                            
+                            {/* CARD 1: CHECKPOINT PROGRESS & LIST */}
+                            <div style={{ backgroundColor: "#0f172a", borderRadius: "12px", padding: "16px", border: "1px solid #334155" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                                    <span style={{ fontSize: "12px", fontWeight: "700", color: "#94a3b8", textTransform: "uppercase" }}>
+                                        Checkpoint Progress
+                                    </span>
+                                    <span style={{
+                                        fontSize: "14px",
+                                        fontWeight: "900",
+                                        color: allScannersScanned ? "#34d399" : "#38bdf8"
+                                    }}>
+                                        {scannedCount} / {totalScanners}
+                                    </span>
                                 </div>
-                                <div style={{ fontSize: "24px", fontWeight: "900", color: isInsideGeofence ? "#34d399" : "#38bdf8" }}>
-                                    {formatDistance(distanceToNextMeters)}
+
+                                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                                    {(nextStop.checkpoints || []).map((cpItem, idx) => (
+                                        <div
+                                            key={cpItem.id || idx}
+                                            style={{
+                                                display: "flex",
+                                                justifyContent: "space-between",
+                                                alignItems: "center",
+                                                backgroundColor: cpItem.is_scanned ? "#064e3b33" : "#1e293b",
+                                                padding: "8px 12px",
+                                                borderRadius: "8px",
+                                                border: "1px solid",
+                                                borderColor: cpItem.is_scanned ? "#059669" : "#334155"
+                                            }}
+                                        >
+                                            <div style={{ fontSize: "13px", fontWeight: "700", color: cpItem.is_scanned ? "#34d399" : "#f8fafc" }}>
+                                                Scanner {cpItem.sequence || idx + 1}: {cpItem.is_scanned ? "✅ Verified" : "⏳ Pending"}
+                                            </div>
+                                            {cpItem.scanned_at && (
+                                                <span style={{ fontSize: "11px", color: "#a7f3d0" }}>
+                                                    {new Date(cpItem.scanned_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                </span>
+                                            )}
+                                        </div>
+                                    ))}
                                 </div>
-                                {!isInsideGeofence && distanceToNextMeters !== null && (
-                                    <div style={{ fontSize: "11px", color: "#94a3b8" }}>Geofence: 100m</div>
-                                )}
                             </div>
 
-                            <button
-                                onClick={() => completeStop(nextStop.id, nextStopCp?.latitude, nextStopCp?.longitude)}
-                                disabled={updatingStop === nextStop.id}
-                                style={{
-                                    backgroundColor: isInsideGeofence ? "#34d399" : "#047857",
-                                    color: isInsideGeofence ? "#064e3b" : "#ffffff",
-                                    padding: "12px 24px",
-                                    borderRadius: "8px",
-                                    border: "none",
-                                    fontWeight: "800",
-                                    fontSize: "14px",
-                                    cursor: "pointer",
-                                    boxShadow: "0 2px 10px rgba(0,0,0,0.3)",
-                                    transition: "transform 0.15s ease"
-                                }}
-                            >
-                                {updatingStop === nextStop.id
-                                    ? "Verifying GPS..."
-                                    : isInsideGeofence
-                                        ? "✓ COMPLETE COLLECTION"
-                                        : "✓ Complete Stop"}
-                            </button>
+                            {/* CARD 2: COLLECTION TIME & GEOFENCE DWELL */}
+                            <div style={{ backgroundColor: "#0f172a", borderRadius: "12px", padding: "16px", border: "1px solid #334155" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                                    <span style={{ fontSize: "12px", fontWeight: "700", color: "#94a3b8", textTransform: "uppercase" }}>
+                                        Collection Time
+                                    </span>
+                                    <span style={{
+                                        fontSize: "11px",
+                                        fontWeight: "800",
+                                        padding: "2px 8px",
+                                        borderRadius: "6px",
+                                        backgroundColor: isDwellMet ? "#065f46" : nextStop.dwell_start_time ? "#0c4a6e" : "#334155",
+                                        color: isDwellMet ? "#6ee7b7" : nextStop.dwell_start_time ? "#38bdf8" : "#94a3b8"
+                                    }}>
+                                        {isDwellMet ? "✓ Duration Met" : nextStop.dwell_start_time ? "Active" : "Pending"}
+                                    </span>
+                                </div>
+
+                                <div style={{ display: "flex", alignItems: "baseline", gap: "8px", margin: "10px 0" }}>
+                                    <span style={{ fontSize: "36px", fontWeight: "900", fontFamily: "monospace", color: isDwellMet ? "#34d399" : "#38bdf8" }}>
+                                        {formatSeconds(liveDwellSeconds)}
+                                    </span>
+                                    <span style={{ fontSize: "16px", fontWeight: "700", color: "#64748b" }}>
+                                        / {formatSeconds(minCollectionSec)}
+                                    </span>
+                                </div>
+
+                                <div style={{ width: "100%", height: "8px", backgroundColor: "#1e293b", borderRadius: "4px", overflow: "hidden", marginBottom: "8px" }}>
+                                    <div style={{
+                                        width: `${Math.min(100, Math.round((liveDwellSeconds / minCollectionSec) * 100))}%`,
+                                        height: "100%",
+                                        backgroundColor: isDwellMet ? "#10b981" : "#0284c7",
+                                        transition: "width 0.4s ease"
+                                    }} />
+                                </div>
+
+                                <div style={{ fontSize: "11px", color: "#94a3b8" }}>
+                                    {nextStop.verification_status === "DWELL_RESET" ? (
+                                        <span style={{ color: "#f87171", fontWeight: "700" }}>
+                                            ⚠️ Timer reset because vehicle left 100m geofence early.
+                                        </span>
+                                    ) : (
+                                        <span>Vehicle must remain inside geofence for min duration.</span>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* CARD 3: PROGRESS VISUALIZATION (Vertical Stepper) */}
+                            <div style={{ backgroundColor: "#0f172a", borderRadius: "12px", padding: "16px", border: "1px solid #334155" }}>
+                                <div style={{ fontSize: "12px", fontWeight: "700", color: "#94a3b8", textTransform: "uppercase", marginBottom: "10px" }}>
+                                    Progress Visualization
+                                </div>
+
+                                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                                    {(nextStop.checkpoints || []).map((cpItem, idx, arr) => (
+                                        <div key={cpItem.id || idx}>
+                                            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                                                <span style={{
+                                                    fontSize: "14px",
+                                                    color: cpItem.is_scanned ? "#34d399" : "#64748b",
+                                                    fontWeight: "800"
+                                                }}>
+                                                    {cpItem.is_scanned ? "●" : "○"}
+                                                </span>
+                                                <span style={{
+                                                    fontSize: "13px",
+                                                    fontWeight: "700",
+                                                    color: cpItem.is_scanned ? "#f8fafc" : "#94a3b8"
+                                                }}>
+                                                    Scanner {cpItem.sequence || idx + 1} {cpItem.is_scanned && "✓"}
+                                                </span>
+                                            </div>
+                                            {idx < arr.length - 1 && (
+                                                <div style={{
+                                                    marginLeft: "4px",
+                                                    borderLeft: "2px solid",
+                                                    borderColor: cpItem.is_scanned && arr[idx + 1].is_scanned ? "#10b981" : "#334155",
+                                                    height: "12px",
+                                                    margin: "2px 0 2px 4px"
+                                                }} />
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+
+                                <div style={{ marginTop: "12px", paddingTop: "8px", borderTop: "1px solid #1e293b", fontSize: "12px", fontWeight: "800", color: allScannersScanned ? "#34d399" : "#38bdf8" }}>
+                                    {allScannersScanned
+                                        ? "✅ COLLECTION ZONE COMPLETED"
+                                        : `${scannedCount} / ${totalScanners} Checkpoints Verified`}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* NEXT CHECKPOINT & SCANNER BUTTON BANNER */}
+                        <div style={{
+                            backgroundColor: "#0f172a",
+                            borderRadius: "14px",
+                            padding: "16px 20px",
+                            border: "1px solid #334155",
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            flexWrap: "wrap",
+                            gap: "14px"
+                        }}>
+                            <div>
+                                {allScannersScanned ? (
+                                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                                        <span style={{ fontSize: "28px" }}>🎉</span>
+                                        <div>
+                                            <div style={{ fontSize: "16px", fontWeight: "900", color: "#34d399" }}>
+                                                All {totalScanners} Checkpoints Verified
+                                            </div>
+                                            <div style={{ fontSize: "12px", color: "#a7f3d0" }}>
+                                                Collection zone successfully serviced and validated with GPS proof.
+                                            </div>
+                                        </div>
+                                    </div>
+                                ) : nextPendingCheckpoint ? (
+                                    <div>
+                                        <div style={{ fontSize: "11px", color: "#38bdf8", fontWeight: "800", textTransform: "uppercase" }}>
+                                            NEXT CHECKPOINT
+                                        </div>
+                                        <div style={{ fontSize: "18px", fontWeight: "900", color: "#ffffff", marginTop: "2px" }}>
+                                            🏷️ {nextPendingCheckpoint.name} ({nextPendingCheckpoint.scanner_code})
+                                        </div>
+                                    </div>
+                                ) : null}
+                            </div>
+
+                            {/* The [ SCAN CHECKPOINT ] Button */}
+                            <div style={{ display: "flex", gap: "10px" }}>
+                                <button
+                                    onClick={() => setMissModalStopId(nextStop.id)}
+                                    disabled={actionLoading}
+                                    style={{
+                                        backgroundColor: "transparent",
+                                        color: "#f87171",
+                                        border: "1px solid #7f1d1d",
+                                        padding: "10px 16px",
+                                        borderRadius: "8px",
+                                        fontWeight: "700",
+                                        fontSize: "13px",
+                                        cursor: "pointer"
+                                    }}
+                                >
+                                    ✕ Report Missed
+                                </button>
+
+                                {allScannersScanned ? (
+                                    <button
+                                        disabled
+                                        style={{
+                                            backgroundColor: "#065f46",
+                                            color: "#6ee7b7",
+                                            border: "1px solid #059669",
+                                            padding: "12px 24px",
+                                            borderRadius: "10px",
+                                            fontWeight: "900",
+                                            fontSize: "14px",
+                                            cursor: "default"
+                                        }}
+                                    >
+                                        ✓ ZONE COMPLETED
+                                    </button>
+                                ) : (
+                                    <button
+                                        onClick={() => setQrScannerOpen(true)}
+                                        disabled={!isInsideGeofence || actionLoading}
+                                        style={{
+                                            background: isInsideGeofence
+                                                ? "linear-gradient(135deg, #0284c7, #0369a1)"
+                                                : "#334155",
+                                            color: isInsideGeofence ? "#ffffff" : "#94a3b8",
+                                            border: "none",
+                                            padding: "12px 26px",
+                                            borderRadius: "10px",
+                                            fontWeight: "900",
+                                            fontSize: "14px",
+                                            cursor: isInsideGeofence ? "pointer" : "not-allowed",
+                                            boxShadow: isInsideGeofence ? "0 4px 15px rgba(2,132,199,0.4)" : "none",
+                                            display: "flex",
+                                            alignItems: "center",
+                                            gap: "8px",
+                                            transition: "all 0.2s ease"
+                                        }}
+                                    >
+                                        <span>📷</span>
+                                        <span>{isInsideGeofence ? "SCAN CHECKPOINT" : "Reach Collection Zone First"}</span>
+                                    </button>
+                                )}
+                            </div>
                         </div>
                     </div>
                 ) : stops.length > 0 ? (
-                    <div style={{ backgroundColor: "#1e293b", padding: "16px 20px", borderRadius: "12px", border: "1px solid #334155", marginBottom: "16px", color: "#34d399", fontWeight: "700", fontSize: "15px" }}>
-                        🎉 All collection stops for this route have been completed or addressed!
+                    <div style={{ backgroundColor: "#1e293b", padding: "18px 24px", borderRadius: "14px", border: "1px solid #334155", marginBottom: "20px", color: "#34d399", fontWeight: "800", fontSize: "16px", display: "flex", alignItems: "center", gap: "10px" }}>
+                        <span>🎉</span>
+                        <span>All collection zones for this route have been completed and verified!</span>
                     </div>
                 ) : null}
 
                 {/* MAIN NAVIGATION GRID: MAP & TURN-BY-TURN LIST */}
-                <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: "16px", alignItems: "start" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: "16px", alignItems: "start" }}>
 
                     {/* INTERACTIVE NAVIGATION MAP */}
                     <div style={{ backgroundColor: "#1e293b", borderRadius: "14px", border: "1px solid #334155", padding: "16px", position: "relative" }}>
@@ -645,7 +875,7 @@ function DriverDashboard({ user, onLogout }) {
                         </div>
 
                         {/* Leaflet Map Frame */}
-                        <div style={{ height: "520px", borderRadius: "10px", overflow: "hidden", border: "1px solid #334155" }}>
+                        <div style={{ height: "480px", borderRadius: "10px", overflow: "hidden", border: "1px solid #334155" }}>
                             <MapContainer
                                 center={defaultCenter}
                                 zoom={14}
@@ -672,7 +902,7 @@ function DriverDashboard({ user, onLogout }) {
                                             <div style={{ color: "#0f172a", fontSize: "13px" }}>
                                                 <strong>🚛 Vehicle {vehicle?.vehicle_number}</strong><br />
                                                 Driver: {vehicle?.driver_name}<br />
-                                                Status: <strong>{vehicle?.status}</strong><br />
+                                                Ward: <strong>{vehicle?.permanent_ward || "Assigned"}</strong><br />
                                                 Speed: {gps?.speed || 0} km/h
                                             </div>
                                         </Popup>
@@ -706,7 +936,7 @@ function DriverDashboard({ user, onLogout }) {
                                                 <div style={{ color: "#0f172a", fontSize: "13px" }}>
                                                     <strong>Stop #{stop.sequence}: {cp.name}</strong><br />
                                                     📍 {cp.address} ({cp.ward})<br />
-                                                    🕐 Scheduled: {cp.scheduled_time || "09:00 AM"}<br />
+                                                    Checkpoints: {stop.progress_text || `${stop.scanned_count || 0}/${stop.total_scanners || 3}`}<br />
                                                     Status: <strong style={{
                                                         color: stop.status === "COMPLETED" ? "#15803d" : stop.status === "MISSED" ? "#b91c1c" : "#b45309"
                                                     }}>{stop.status}</strong>
@@ -722,11 +952,11 @@ function DriverDashboard({ user, onLogout }) {
                         <div style={{ display: "flex", gap: "16px", marginTop: "12px", fontSize: "12px", color: "#94a3b8", justifyContent: "center", flexWrap: "wrap" }}>
                             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                                 <span style={{ width: "12px", height: "12px", borderRadius: "50%", backgroundColor: "#0284c7", display: "inline-block" }}></span>
-                                <span>⭐ Next Stop</span>
+                                <span>⭐ Current Zone</span>
                             </div>
                             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                                 <span style={{ width: "12px", height: "12px", borderRadius: "50%", backgroundColor: "#f59e0b", display: "inline-block" }}></span>
-                                <span>🟡 Pending Stop</span>
+                                <span>🟡 Pending Zone</span>
                             </div>
                             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                                 <span style={{ width: "12px", height: "12px", borderRadius: "50%", backgroundColor: "#16a34a", display: "inline-block" }}></span>
@@ -745,10 +975,10 @@ function DriverDashboard({ user, onLogout }) {
                         <div style={{ backgroundColor: "#1e293b", borderRadius: "14px", border: "1px solid #334155", padding: "18px" }}>
                             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
                                 <span style={{ fontSize: "13px", fontWeight: "700", color: "#94a3b8", textTransform: "uppercase" }}>
-                                    Route Progress
+                                    Ward Collection Progress
                                 </span>
                                 <span style={{ fontSize: "14px", fontWeight: "800", color: "#34d399" }}>
-                                    {summary.completed_count} / {summary.total_stops} completed ({summary.progress_percent}%)
+                                    {summary.completed_count} / {summary.total_stops} zones ({summary.progress_percent}%)
                                 </span>
                             </div>
 
@@ -773,11 +1003,11 @@ function DriverDashboard({ user, onLogout }) {
                             </div>
                         </div>
 
-                        {/* ORDERED TURN-BY-TURN STOP LIST */}
-                        <div style={{ backgroundColor: "#1e293b", borderRadius: "14px", border: "1px solid #334155", padding: "18px", maxHeight: "420px", overflowY: "auto" }}>
+                        {/* ORDERED TURN-BY-TURN ZONE LIST */}
+                        <div style={{ backgroundColor: "#1e293b", borderRadius: "14px", border: "1px solid #334155", padding: "18px", maxHeight: "380px", overflowY: "auto" }}>
                             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
                                 <h4 style={{ margin: 0, fontSize: "14px", fontWeight: "800", color: "#f8fafc", textTransform: "uppercase" }}>
-                                    Route Sequence (1 → {stops.length})
+                                    Zone Route Sequence (1 → {stops.length})
                                 </h4>
                                 <span style={{ fontSize: "11px", color: "#94a3b8" }}>
                                     Total: {route?.total_distance_km || "0.00"} km
@@ -786,7 +1016,7 @@ function DriverDashboard({ user, onLogout }) {
 
                             {stops.length === 0 ? (
                                 <div style={{ textAlign: "center", padding: "30px", color: "#94a3b8", fontSize: "13px" }}>
-                                    No collection stops assigned for {selectedDate}.
+                                    No collection zones assigned for {selectedDate}.
                                 </div>
                             ) : (
                                 <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
@@ -834,40 +1064,31 @@ function DriverDashboard({ user, onLogout }) {
                                                     <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "4px" }}>
                                                         📍 {cp.address} ({cp.ward})
                                                     </div>
-                                                    {isCompleted && (
-                                                        <div style={{ fontSize: "11px", color: "#4ade80", marginTop: "2px", fontWeight: "600" }}>
-                                                            ✓ Completed at {stop.actual_arrival ? new Date(stop.actual_arrival).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "Done"}
-                                                        </div>
-                                                    )}
-                                                    {isMissed && (
-                                                        <div style={{ fontSize: "11px", color: "#f87171", marginTop: "2px", fontWeight: "600" }}>
-                                                            ❌ Reason: {stop.miss_reason || "Missed"}
-                                                        </div>
-                                                    )}
+
+                                                    {/* Verification Metrics Tag */}
+                                                    <div style={{ display: "flex", gap: "8px", marginTop: "4px", fontSize: "11px" }}>
+                                                        <span style={{ color: stop.scanned_count >= stop.total_scanners ? "#4ade80" : "#fbbf24", fontWeight: "700" }}>
+                                                            Checkpoints: {stop.progress_text || `${stop.scanned_count || 0}/${stop.total_scanners || 3}`}
+                                                        </span>
+                                                        {isCompleted && (
+                                                            <span style={{ color: "#4ade80", fontWeight: "600" }}>
+                                                                • Verified at {stop.actual_arrival ? new Date(stop.actual_arrival).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "Done"}
+                                                            </span>
+                                                        )}
+                                                        {isMissed && (
+                                                            <span style={{ color: "#f87171", fontWeight: "600" }}>
+                                                                • ❌ {stop.miss_reason || "Missed"}
+                                                            </span>
+                                                        )}
+                                                    </div>
                                                 </div>
 
                                                 {/* Action buttons for pending stop */}
-                                                {stop.status === "PENDING" && (
-                                                    <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                                                        <button
-                                                            onClick={() => completeStop(stop.id, cp.latitude, cp.longitude)}
-                                                            disabled={updatingStop === stop.id}
-                                                            style={{
-                                                                backgroundColor: isNext && isInsideGeofence ? "#34d399" : "#10b981",
-                                                                color: isNext && isInsideGeofence ? "#064e3b" : "white",
-                                                                padding: "6px 12px",
-                                                                borderRadius: "6px",
-                                                                border: "none",
-                                                                fontWeight: "700",
-                                                                fontSize: "12px",
-                                                                cursor: "pointer"
-                                                            }}
-                                                        >
-                                                            {updatingStop === stop.id ? "..." : "✓ Done"}
-                                                        </button>
+                                                {stop.status === "PENDING" && !isNext && (
+                                                    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
                                                         <button
                                                             onClick={() => setMissModalStopId(stop.id)}
-                                                            disabled={updatingStop === stop.id}
+                                                            disabled={actionLoading}
                                                             style={{
                                                                 backgroundColor: "transparent",
                                                                 color: "#f87171",
@@ -893,6 +1114,20 @@ function DriverDashboard({ user, onLogout }) {
                 </div>
             </main>
 
+            {/* In-Dashboard Camera QR Scanner Modal */}
+            <CheckpointQRScannerModal
+                isOpen={qrScannerOpen}
+                onClose={() => setQrScannerOpen(false)}
+                nextStop={nextStop}
+                onScanSuccess={async () => {
+                    await fetchDriverRoute(selectedDate);
+                }}
+                vehiclePosition={vehiclePosition}
+                driverId={user.id}
+                vehicleId={vehicle?.id}
+                api={api}
+            />
+
             {/* Miss Reason Modal */}
             {missModalStopId && (
                 <div style={{
@@ -906,10 +1141,10 @@ function DriverDashboard({ user, onLogout }) {
                 }}>
                     <div style={{ backgroundColor: "#1e293b", padding: "24px", borderRadius: "12px", width: "400px", maxWidth: "90%", border: "1px solid #334155" }}>
                         <h3 style={{ marginTop: 0, color: "#f87171", fontSize: "18px" }}>
-                            Report Missed Collection Point
+                            Report Missed Collection Zone
                         </h3>
                         <p style={{ fontSize: "13px", color: "#cbd5e1" }}>
-                            Please specify a reason why this collection point could not be serviced.
+                            Please specify a reason why this collection zone could not be serviced.
                         </p>
                         <select
                             value={missReason}
@@ -928,7 +1163,7 @@ function DriverDashboard({ user, onLogout }) {
                             <option value="Heavy Traffic">Heavy Traffic</option>
                             <option value="Road Block / Construction">Road Block / Construction</option>
                             <option value="Vehicle Breakdown">Vehicle Breakdown</option>
-                            <option value="Inaccessible Location">Inaccessible Location</option>
+                            <option value="Inaccessible Road / Narrow Lane">Inaccessible Road / Narrow Lane</option>
                             <option value="Time Constraint">Time Constraint</option>
                         </select>
                         <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>

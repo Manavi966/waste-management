@@ -138,6 +138,7 @@ function CitizenDashboard({ user, onLogout }) {
     const [trackingError, setTrackingError] = useState("");
     const [geoPermissionError, setGeoPermissionError] = useState("");
     const [lastRefreshedAt, setLastRefreshedAt] = useState(null);
+    const [wardNotifications, setWardNotifications] = useState([]);
 
     // Map Action Trigger
     const [mapAction, setMapAction] = useState(null);
@@ -185,6 +186,18 @@ function CitizenDashboard({ user, onLogout }) {
             const res = await api.get(`/citizen/collection-status?${params.toString()}`);
             setTrackingData(res.data);
             setLastRefreshedAt(new Date());
+
+            const currentWard = res.data?.collectionPoint?.ward || res.data?.collection_point?.ward;
+            if (currentWard) {
+                try {
+                    const notifRes = await api.get(`/citizen/notifications?ward=${encodeURIComponent(currentWard)}`);
+                    setWardNotifications(notifRes.data || []);
+                } catch (ne) {
+                    console.error("Error loading ward notifications:", ne);
+                }
+            } else {
+                setWardNotifications([]);
+            }
 
             if (!res.data.found) {
                 setTrackingError(res.data.message || "No collection point found near your location.");
@@ -654,6 +667,96 @@ function CitizenDashboard({ user, onLogout }) {
                 {/* ACTIVE REAL-TIME TRACKING EXPERIENCE */}
                 {locationMode && trackingData && trackingData.found && (
                     <div>
+                        {/* VEHICLE MAINTENANCE ALERT BANNER (No replacement yet) */}
+                        {trackingData.is_maintenance && !trackingData.is_replacement && !trackingData.replacement_assigned && (
+                            <div style={{
+                                backgroundColor: "#fff1f2",
+                                border: "2px solid #e11d48",
+                                borderRadius: "12px",
+                                padding: "18px 22px",
+                                marginBottom: "20px",
+                                boxShadow: "0 4px 12px rgba(225, 29, 72, 0.12)",
+                                display: "flex",
+                                alignItems: "flex-start",
+                                gap: "14px"
+                            }}>
+                                <span style={{ fontSize: "32px", lineHeight: 1 }}>⚠️</span>
+                                <div style={{ flex: 1 }}>
+                                    <div style={{ fontSize: "16px", fontWeight: "800", color: "#9f1239" }}>
+                                        Vehicle Maintenance Notice • {pointData?.ward || "Your Area"}
+                                    </div>
+                                    <div style={{ fontSize: "14px", color: "#be123c", marginTop: "4px", lineHeight: "1.5", fontWeight: "500" }}>
+                                        {trackingData.maintenance_message || "Your area's waste collection vehicle is currently under maintenance and will not be able to collect waste today. Please check the app for further updates."}
+                                    </div>
+                                    {trackingData.vehicle && (
+                                        <div style={{ marginTop: "10px", display: "inline-flex", alignItems: "center", gap: "8px", backgroundColor: "white", padding: "6px 12px", borderRadius: "8px", border: "1px solid #fecdd3" }}>
+                                            <span style={{ fontSize: "12px", color: "#881337", fontWeight: "700" }}>
+                                                🚛 Assigned Vehicle: {trackingData.vehicle.vehicleNumber || trackingData.vehicle.vehicle_number}
+                                            </span>
+                                            <span style={{ backgroundColor: "#fee2e2", color: "#b91c1c", fontSize: "11px", fontWeight: "800", padding: "2px 8px", borderRadius: "10px" }}>
+                                                MAINTENANCE
+                                            </span>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* TEMPORARY REPLACEMENT NOTICE BANNER */}
+                        {(trackingData.is_replacement || trackingData.replacement_assigned || vehicleData?.is_replacement) && (
+                            <div style={{
+                                backgroundColor: "#eff6ff",
+                                border: "2px solid #2563eb",
+                                borderRadius: "12px",
+                                padding: "18px 22px",
+                                marginBottom: "20px",
+                                boxShadow: "0 4px 12px rgba(37, 99, 235, 0.12)",
+                                display: "flex",
+                                alignItems: "flex-start",
+                                gap: "14px"
+                            }}>
+                                <span style={{ fontSize: "32px", lineHeight: 1 }}>🔄</span>
+                                <div style={{ flex: 1 }}>
+                                    <div style={{ fontSize: "16px", fontWeight: "800", color: "#1e40af" }}>
+                                        Replacement Vehicle Assigned • {pointData?.ward || "Your Area"}
+                                    </div>
+                                    <div style={{ fontSize: "14px", color: "#1d4ed8", marginTop: "4px", lineHeight: "1.5", fontWeight: "500" }}>
+                                        {trackingData.replacement_banner || "Your regular collection vehicle is under maintenance. A replacement vehicle has been assigned for today's collection."}
+                                    </div>
+                                    <div style={{ marginTop: "10px", display: "flex", gap: "12px", flexWrap: "wrap" }}>
+                                        <div style={{ backgroundColor: "white", padding: "6px 12px", borderRadius: "8px", border: "1px solid #bfdbfe", fontSize: "12px", color: "#1e3a8a", fontWeight: "600" }}>
+                                            Regular Vehicle: <strong style={{ color: "#dc2626" }}>{vehicleData?.regular_vehicle_number || trackingData.regular_vehicle_number || "Under Maintenance"}</strong>
+                                        </div>
+                                        <div style={{ backgroundColor: "white", padding: "6px 12px", borderRadius: "8px", border: "1px solid #bfdbfe", fontSize: "12px", color: "#1e3a8a", fontWeight: "600" }}>
+                                            Replacement Vehicle: <strong style={{ color: "#047857" }}>{vehicleData?.vehicleNumber || vehicleData?.vehicle_number}</strong>
+                                        </div>
+                                        <div style={{ backgroundColor: "white", padding: "6px 12px", borderRadius: "8px", border: "1px solid #bfdbfe", fontSize: "12px", color: "#1e3a8a", fontWeight: "600" }}>
+                                            Driver: <strong>{driverData?.name || "Assigned Driver"}</strong>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* WARD ANNOUNCEMENTS / NOTIFICATIONS */}
+                        {wardNotifications.length > 0 && (
+                            <div style={{ backgroundColor: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: "10px", padding: "12px 18px", marginBottom: "18px" }}>
+                                <div style={{ fontSize: "12px", fontWeight: "700", color: "#475569", textTransform: "uppercase", marginBottom: "6px", display: "flex", alignItems: "center", gap: "6px" }}>
+                                    <span>📢</span> Area Announcements ({pointData?.ward})
+                                </div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                                    {wardNotifications.slice(0, 2).map((n) => (
+                                        <div key={n.id} style={{ fontSize: "13px", color: "#334155", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                            <span><strong>{n.title}:</strong> {n.message}</span>
+                                            <span style={{ fontSize: "11px", color: "#94a3b8", whiteSpace: "nowrap", marginLeft: "12px" }}>
+                                                {new Date(n.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
                         {/* 4 CLEAR INFORMATION CARDS */}
                         <div style={{
                             display: "grid",
@@ -708,6 +811,20 @@ function CitizenDashboard({ user, onLogout }) {
                                             <span style={{ color: "#64748b" }}>Arrival time unavailable</span>
                                         )}
                                     </div>
+
+                                    {/* Collection Zone Checkpoint Progress */}
+                                    {collectionData?.checkpoint_progress && (
+                                        <div style={{ marginTop: "10px", display: "flex", alignItems: "center", justifyContent: "space-between", backgroundColor: "#f8fafc", padding: "6px 10px", borderRadius: "6px", border: "1px solid #e2e8f0" }}>
+                                            <span style={{ fontSize: "11px", color: "#64748b", fontWeight: "700" }}>CHECKPOINTS:</span>
+                                            <span style={{
+                                                fontSize: "12px",
+                                                fontWeight: "800",
+                                                color: collectionData.status === "COMPLETED" ? "#16a34a" : "#0284c7"
+                                            }}>
+                                                {collectionData.status === "COMPLETED" ? `✓ ${collectionData.checkpoint_progress} (Completed)` : `${collectionData.checkpoint_progress} Scanned`}
+                                            </span>
+                                        </div>
+                                    )}
                                 </div>
                             </div>
 

@@ -2,9 +2,14 @@ import React, { useState, useEffect } from "react";
 import api from "../services/api";
 
 function AssignVehiclePage({ selectedDate: propSelectedDate, setSelectedDate: propSetSelectedDate }) {
+    const [wardData, setWardData] = useState([]);
     const [vehicles, setVehicles] = useState([]);
-    const [points, setPoints] = useState([]);
-    const [counts, setCounts] = useState({ total: 0, available: 0, assigned_to_current: 0, assigned_to_other: 0, total_assigned: 0 });
+    const [eligibleReplacements, setEligibleReplacements] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [submitting, setSubmitting] = useState(false);
+    const [message, setMessage] = useState({ text: "", isError: false, type: "success" });
+
+    // Operation Date state synchronized with Authority Dashboard
     const [localSelectedDate, setLocalSelectedDate] = useState(() => {
         return propSelectedDate || localStorage.getItem("authority_operation_date") || "2026-09-20";
     });
@@ -16,870 +21,1047 @@ function AssignVehiclePage({ selectedDate: propSelectedDate, setSelectedDate: pr
         setLocalSelectedDate(newDate);
         localStorage.setItem("authority_operation_date", newDate);
     };
-    const [selectedVehicleId, setSelectedVehicleId] = useState("");
-    const [selectedPointIds, setSelectedPointIds] = useState([]);
-    const [optimizedRoute, setOptimizedRoute] = useState(null);
 
-    const [loading, setLoading] = useState(true);
-    const [submitting, setSubmitting] = useState(false);
-    const [message, setMessage] = useState({ text: "", isError: false, isConflict: false });
+    // Modal 1: Permanent Assignment Setup Modal State
+    const [showPermanentModal, setShowPermanentModal] = useState(false);
+    const [selectedWardForPerm, setSelectedWardForPerm] = useState("");
+    const [selectedVehForPerm, setSelectedVehForPerm] = useState("");
 
-    // Maintenance section state
-    const [maintenanceVehicles, setMaintenanceVehicles] = useState([]);
-    const [reassignTargets, setReassignTargets] = useState({});
+    // Modal 2: Temporary Replacement Modal State (Maintenance only)
+    const [showReplacementModal, setShowReplacementModal] = useState(false);
+    const [maintWardInfo, setMaintWardInfo] = useState(null);
+    const [selectedReplacementVehId, setSelectedReplacementVehId] = useState("");
 
-    // Load vehicles list on mount or date change
-    const loadVehicles = async (dateToUse = selectedDate) => {
+    // Robust function to load all areas, collection points, and vehicles from database
+    const loadWardOverview = async (dateToUse = selectedDate) => {
+        setLoading(true);
         try {
-            const vRes = await api.get("/vehicles");
-            const allVehicles = vRes.data || [];
-            setVehicles(allVehicles);
+            // Load ward overview and also fallback-fetch vehicles & areas to guarantee full dataset
+            const [overviewRes, vehiclesRes, pointsRes] = await Promise.all([
+                api.get(`/admin/ward-overview?date=${dateToUse}`).catch(() => ({ data: null })),
+                api.get(`/vehicles?date=${dateToUse}`).catch(() => ({ data: [] })),
+                api.get(`/collection-points`).catch(() => ({ data: [] }))
+            ]);
 
-            // Check maintenance vehicles with pending points
-            const maintList = [];
-            for (const v of allVehicles) {
-                if (v.status === "MAINTENANCE") {
-                    try {
-                        const detailsRes = await api.get(`/vehicles/${v.id}/details?date=${dateToUse}`);
-                        const pendingStops = detailsRes.data.pending_areas || [];
-                        maintList.push({
-                            ...v,
-                            pendingStops,
-                            needsReassignment: pendingStops.length > 0
-                        });
-                    } catch (e) {
-                        maintList.push({ ...v, pendingStops: [], needsReassignment: false });
-                    }
-                }
+            let loadedWards = overviewRes?.data?.wards || [];
+            let loadedVehicles = overviewRes?.data?.vehicles || vehiclesRes?.data || [];
+            let loadedReplacements = overviewRes?.data?.eligible_replacements || [];
+
+            // If overview wards were empty, construct from collection points and assignments
+            if (loadedWards.length === 0 && pointsRes.data && pointsRes.data.length > 0) {
+                const points = pointsRes.data;
+                const distinctWards = Array.from(new Set(points.map(p => p.ward).filter(Boolean))).sort();
+                
+                loadedWards = distinctWards.map(wardName => {
+                    const wardPoints = points.filter(p => p.ward === wardName);
+                    const matchingVeh = loadedVehicles.find(v => v.permanent_ward === wardName);
+                    return {
+                        ward: wardName,
+                        collection_points: wardPoints,
+                        total_points: wardPoints.length,
+                        permanent_vehicle: matchingVeh ? {
+                            vehicle_id: matchingVeh.id,
+                            vehicle_number: matchingVeh.vehicle_number,
+                            vehicle_status: matchingVeh.status,
+                            driver_name: matchingVeh.driver_name,
+                            driver_phone: matchingVeh.driver_phone
+                        } : null,
+                        temporary_vehicle: null,
+                        is_maintenance: matchingVeh ? (matchingVeh.status === "MAINTENANCE" || matchingVeh.status === "INACTIVE") : false,
+                        has_replacement: false,
+                        operating_status: "NORMAL"
+                    };
+                });
             }
-            setMaintenanceVehicles(maintList);
+
+            if (loadedVehicles.length === 0 && vehiclesRes.data) {
+                loadedVehicles = vehiclesRes.data;
+            }
+
+            if (loadedReplacements.length === 0 && loadedVehicles.length > 0) {
+                loadedReplacements = loadedVehicles.filter(v => v.status !== "MAINTENANCE" && v.status !== "INACTIVE" && v.status !== "OUT_OF_SERVICE");
+            }
+
+            setWardData(loadedWards);
+            setVehicles(loadedVehicles);
+            setEligibleReplacements(loadedReplacements);
         } catch (err) {
-            console.error("Failed to load vehicles:", err);
-            setMessage({ text: "Failed to load vehicles list.", isError: true, isConflict: false });
+            console.error("Failed to load ward overview:", err);
+            setMessage({
+                text: "Failed to load permanent area assignments and ward details.",
+                isError: true,
+                type: "error"
+            });
         } finally {
             setLoading(false);
         }
     };
 
-    // Fetch dynamic collection point availability and existing vehicle route from backend
-    const fetchPointsAndRoute = async (vehicleId, dateStr) => {
-        if (!vehicleId) {
-            setPoints([]);
-            setSelectedPointIds([]);
-            setOptimizedRoute(null);
-            setCounts({ total: 0, available: 0, assigned_to_current: 0, assigned_to_other: 0, total_assigned: 0 });
-            return;
-        }
-
-        try {
-            const [availRes, detailsRes] = await Promise.all([
-                api.get(`/admin/available-collection-points?date=${dateStr}&vehicle_id=${vehicleId}`)
-                    .catch(() => api.get(`/collection-points/available?date=${dateStr}&vehicle_id=${vehicleId}`)),
-                api.get(`/vehicles/${vehicleId}/details?date=${dateStr}`).catch(() => ({ data: null }))
-            ]);
-
-            const pointList = availRes.data.points || [];
-            setPoints(pointList);
-            setCounts(availRes.data.counts || {
-                total: pointList.length,
-                available: pointList.filter(p => p.assignment_status === "AVAILABLE").length,
-                assigned_to_current: pointList.filter(p => p.assignment_status === "ASSIGNED_TO_CURRENT").length,
-                assigned_to_other: pointList.filter(p => p.assignment_status === "ASSIGNED_TO_OTHER").length,
-                total_assigned: pointList.filter(p => p.assignment_status !== "AVAILABLE").length
-            });
-
-            // Pre-select only points already assigned to THIS vehicle
-            const currentVehiclePointIds = pointList
-                .filter(p => p.assignment_status === "ASSIGNED_TO_CURRENT")
-                .map(p => p.id);
-            setSelectedPointIds(currentVehiclePointIds);
-
-            // Load optimized route sequence if exists
-            const vehicleInfo = detailsRes?.data;
-            if (vehicleInfo?.vehicle?.route_id) {
-                try {
-                    const routeRes = await api.get(`/routes/${vehicleInfo.vehicle.route_id}`);
-                    setOptimizedRoute({
-                        route: routeRes.data.route,
-                        stops: routeRes.data.stops || []
-                    });
-                } catch (e) {
-                    setOptimizedRoute(null);
-                }
-            } else {
-                setOptimizedRoute(null);
-            }
-        } catch (err) {
-            console.error("Error fetching points and route:", err);
-            setMessage({ text: "Failed to load collection points for this vehicle.", isError: true, isConflict: false });
-        }
-    };
-
     useEffect(() => {
-        loadVehicles(selectedDate);
+        loadWardOverview(selectedDate);
+
+        const handleUpdate = () => {
+            const storedDate = localStorage.getItem("authority_operation_date") || selectedDate;
+            loadWardOverview(storedDate);
+        };
+
+        window.addEventListener("focus", handleUpdate);
+        window.addEventListener("vehicle_assignment_updated", handleUpdate);
+        window.addEventListener("storage", handleUpdate);
+
+        return () => {
+            window.removeEventListener("focus", handleUpdate);
+            window.removeEventListener("vehicle_assignment_updated", handleUpdate);
+            window.removeEventListener("storage", handleUpdate);
+        };
     }, [selectedDate]);
 
-    useEffect(() => {
-        if (selectedVehicleId) {
-            fetchPointsAndRoute(selectedVehicleId, selectedDate);
-        } else {
-            setPoints([]);
-            setSelectedPointIds([]);
-            setOptimizedRoute(null);
-        }
-    }, [selectedVehicleId, selectedDate]);
+    // Open Permanent Modal for a specific ward
+    // Open Permanent Modal for a specific ward or vehicle
+    const openPermanentModal = (wardName = "", currentVehId = "") => {
+        let vehIdStr = currentVehId ? currentVehId.toString() : "";
+        let wardStr = wardName;
 
-    const handleVehicleChange = (newVehId) => {
-        setSelectedVehicleId(newVehId);
-        setSelectedPointIds([]); // Clear previous vehicle selection
-        setMessage({ text: "", isError: false, isConflict: false });
-    };
-
-    const handleDateChange = (newDate) => {
-        setSelectedDate(newDate);
-        setMessage({ text: "", isError: false, isConflict: false });
-    };
-
-    const togglePointSelect = (point) => {
-        // Points assigned to other vehicles are NOT selectable
-        if (point.assignment_status === "ASSIGNED_TO_OTHER") {
-            return;
-        }
-
-        if (selectedPointIds.includes(point.id)) {
-            setSelectedPointIds(selectedPointIds.filter(item => item !== point.id));
-        } else {
-            setSelectedPointIds([...selectedPointIds, point.id]);
-        }
-    };
-
-    const handleSelectAllAvailable = () => {
-        const availableAndCurrentIds = points
-            .filter(p => p.assignment_status === "AVAILABLE" || p.assignment_status === "ASSIGNED_TO_CURRENT")
-            .map(p => p.id);
-        setSelectedPointIds(availableAndCurrentIds);
-    };
-
-    const handleClearSelection = () => {
-        setSelectedPointIds([]);
-    };
-
-    // Save assignment: Authority manually assigns points to the selected vehicle
-    const handleSaveAssignment = async (e) => {
-        e.preventDefault();
-        if (!selectedVehicleId) {
-            setMessage({ text: "Please select a vehicle first.", isError: true, isConflict: false });
-            return;
-        }
-
-        if (selectedPointIds.length === 0) {
-            setMessage({ text: "Please select at least one collection point to assign.", isError: true, isConflict: false });
-            return;
-        }
-
-        const currentVeh = vehicles.find(v => v.id.toString() === selectedVehicleId.toString());
-        if (currentVeh && (currentVeh.status === "MAINTENANCE" || currentVeh.status === "INACTIVE")) {
-            setMessage({ text: `Vehicle ${currentVeh.vehicle_number} is under ${currentVeh.status} and cannot receive assignments.`, isError: true, isConflict: false });
-            return;
-        }
-
-        setSubmitting(true);
-        setMessage({ text: "", isError: false, isConflict: false });
-
-        try {
-            const response = await api.post("/routes/assign-locations", {
-                vehicle_id: Number(selectedVehicleId),
-                collection_point_ids: selectedPointIds.map(Number),
-                route_date: selectedDate
-            });
-
-            setMessage({
-                text: response.data.message || `Successfully assigned ${selectedPointIds.length} collection points to ${currentVeh?.vehicle_number}. Route sequence optimized.`,
-                isError: false,
-                isConflict: false
-            });
-
-            // Immediately refresh availability list from backend
-            await fetchPointsAndRoute(selectedVehicleId, selectedDate);
-            window.dispatchEvent(new CustomEvent("vehicle_assignment_updated", { detail: { date: selectedDate } }));
-            localStorage.setItem("last_assignment_timestamp", Date.now().toString());
-        } catch (err) {
-            console.error("Assignment error:", err);
-            const isConflict = err.response?.status === 409;
-            const errorMsg = err.response?.data?.message || "Failed to assign collection points.";
-
-            setMessage({
-                text: isConflict ? `⚠️ ${errorMsg}` : errorMsg,
-                isError: true,
-                isConflict
-            });
-
-            // Immediately refresh list from backend so user sees latest state
-            await fetchPointsAndRoute(selectedVehicleId, selectedDate);
-        } finally {
-            setSubmitting(false);
-        }
-    };
-
-    // Maintenance vehicle reassignment
-    const handleReassignMaintenance = async (fromVehicleId) => {
-        const toVehicleId = reassignTargets[fromVehicleId];
-        if (!toVehicleId) {
-            alert("Please select an available replacement vehicle from the dropdown.");
-            return;
-        }
-
-        setSubmitting(true);
-        setMessage({ text: "", isError: false, isConflict: false });
-
-        try {
-            const response = await api.post("/routes/reassign-vehicle", {
-                from_vehicle_id: Number(fromVehicleId),
-                to_vehicle_id: Number(toVehicleId),
-                route_date: selectedDate,
-                update_from_status: "MAINTENANCE"
-            });
-
-            setMessage({
-                text: response.data.message || "Collection points successfully reassigned. Route optimized.",
-                isError: false,
-                isConflict: false
-            });
-
-            await loadVehicles(selectedDate);
-            if (selectedVehicleId) {
-                await fetchPointsAndRoute(selectedVehicleId, selectedDate);
+        if (!vehIdStr && wardStr) {
+            const matchingWard = wardData.find(w => w.ward === wardStr);
+            if (matchingWard?.permanent_vehicle) {
+                vehIdStr = (matchingWard.permanent_vehicle.vehicle_id || matchingWard.permanent_vehicle.id || "").toString();
             }
-            window.dispatchEvent(new CustomEvent("vehicle_assignment_updated", { detail: { date: selectedDate } }));
-            localStorage.setItem("last_assignment_timestamp", Date.now().toString());
-        } catch (err) {
-            console.error("Reassignment error:", err);
+        }
+
+        if (vehIdStr && !wardStr) {
+            const matchingVeh = vehicles.find(v => v.id.toString() === vehIdStr);
+            wardStr = matchingVeh?.permanent_ward || wardData.find(w => w.permanent_vehicle?.vehicle_id?.toString() === vehIdStr)?.ward || "";
+        }
+
+        setSelectedVehForPerm(vehIdStr);
+        setSelectedWardForPerm(wardStr);
+        setShowPermanentModal(true);
+    };
+
+    // When vehicle changes in the modal, update selected ward to its current assignment (or reset if unassigned)
+    const handleModalVehChange = (vehId) => {
+        setSelectedVehForPerm(vehId);
+        if (!vehId) {
+            setSelectedWardForPerm("");
+            return;
+        }
+        const matchingVeh = vehicles.find(v => v.id.toString() === vehId.toString());
+        const currentWard = matchingVeh?.permanent_ward || wardData.find(w => w.permanent_vehicle?.vehicle_id?.toString() === vehId.toString())?.ward || "";
+        setSelectedWardForPerm(currentWard);
+    };
+
+    // Open Temporary Replacement Modal
+    const openReplacementModal = (wardItem) => {
+        setMaintWardInfo(wardItem);
+        setSelectedReplacementVehId("");
+        setShowReplacementModal(true);
+    };
+
+    // Handle Permanent Vehicle Assignment (Initial Setup / Reconfiguration)
+    const handleSavePermanentAssignment = async (e) => {
+        e.preventDefault();
+        if (!selectedVehForPerm) {
+            setMessage({ text: "Please select a Vehicle.", isError: true, type: "error" });
+            return;
+        }
+
+        if (!selectedWardForPerm) {
+            setMessage({ text: "Please select a Target Area / Ward.", isError: true, type: "error" });
+            return;
+        }
+
+        // Validate vehicle is not in MAINTENANCE
+        const chosenVeh = vehicles.find(v => v.id.toString() === selectedVehForPerm.toString());
+        if (chosenVeh && (chosenVeh.status === "MAINTENANCE" || chosenVeh.status === "INACTIVE" || chosenVeh.status === "OUT_OF_SERVICE")) {
             setMessage({
-                text: err.response?.data?.message || "Failed to reassign collection points.",
+                text: `Vehicle ${chosenVeh.vehicle_number} is currently under ${chosenVeh.status} and cannot be assigned as a permanent vehicle.`,
                 isError: true,
-                isConflict: false
+                type: "error"
+            });
+            return;
+        }
+
+        setSubmitting(true);
+        try {
+            const res = await api.post("/admin/set-permanent-area", {
+                vehicle_id: Number(selectedVehForPerm),
+                ward: selectedWardForPerm
+            });
+
+            const vehicleNum = chosenVeh?.vehicle_number || res.data?.vehicle_number || "Vehicle";
+            setMessage({
+                text: res.data.message || `${vehicleNum} is now permanently assigned to ${selectedWardForPerm}.`,
+                isError: false,
+                type: "success"
+            });
+            setShowPermanentModal(false);
+            await loadWardOverview(selectedDate);
+            window.dispatchEvent(new CustomEvent("vehicle_assignment_updated", { detail: { date: selectedDate } }));
+        } catch (err) {
+            console.error("Permanent assignment error:", err);
+            setMessage({
+                text: err.response?.data?.message || err.message || "Failed to save permanent assignment.",
+                isError: true,
+                type: "error"
             });
         } finally {
             setSubmitting(false);
         }
     };
 
-    if (loading) return <div style={{ padding: "30px" }}>Loading Collection Point Assignment Portal...</div>;
+    // Handle Assigning Temporary Replacement (Authority action during Maintenance)
+    const handleSaveReplacement = async (e) => {
+        e.preventDefault();
+        if (!maintWardInfo || !selectedReplacementVehId) {
+            setMessage({ text: "Please select a replacement vehicle.", isError: true, type: "error" });
+            return;
+        }
 
-    const selectedVehicle = vehicles.find(v => v.id.toString() === selectedVehicleId.toString());
-    const isMaintenance = selectedVehicle && (selectedVehicle.status === "MAINTENANCE" || selectedVehicle.status === "INACTIVE");
-    const eligibleReplacementVehicles = vehicles.filter(v => v.status !== "MAINTENANCE" && v.status !== "INACTIVE");
+        setSubmitting(true);
+        try {
+            const res = await api.post("/admin/assign-replacement", {
+                maintenance_vehicle_id: maintWardInfo.permanent_vehicle?.vehicle_id || maintWardInfo.permanent_vehicle?.id,
+                replacement_vehicle_id: Number(selectedReplacementVehId),
+                ward: maintWardInfo.ward,
+                start_date: selectedDate
+            });
+
+            setMessage({
+                text: res.data.message || `Temporary replacement vehicle assigned to ${maintWardInfo.ward}.`,
+                isError: false,
+                type: "success"
+            });
+            setShowReplacementModal(false);
+            await loadWardOverview(selectedDate);
+            window.dispatchEvent(new CustomEvent("vehicle_assignment_updated", { detail: { date: selectedDate } }));
+        } catch (err) {
+            console.error("Replacement assignment error:", err);
+            setMessage({
+                text: err.response?.data?.message || "Failed to assign replacement vehicle.",
+                isError: true,
+                type: "error"
+            });
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    // Handle Ending Temporary Replacement
+    const handleRemoveReplacement = async (wardName) => {
+        if (!window.confirm(`End temporary replacement for ${wardName} and restore regular vehicle?`)) return;
+
+        setSubmitting(true);
+        try {
+            const res = await api.post("/admin/remove-replacement", { ward: wardName });
+            setMessage({
+                text: res.data.message || `Temporary replacement ended. Regular assignment restored for ${wardName}.`,
+                isError: false,
+                type: "success"
+            });
+            await loadWardOverview(selectedDate);
+            window.dispatchEvent(new CustomEvent("vehicle_assignment_updated", { detail: { date: selectedDate } }));
+        } catch (err) {
+            console.error("Remove replacement error:", err);
+            setMessage({
+                text: err.response?.data?.message || "Failed to end temporary replacement.",
+                isError: true,
+                type: "error"
+            });
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    // Helper to get collection points of currently selected ward inside modal
+    const selectedWardPoints = selectedWardForPerm
+        ? (wardData.find(w => w.ward === selectedWardForPerm)?.collection_points || [])
+        : [];
 
     return (
-        <div style={{ padding: "24px", maxWidth: "1250px", margin: "0 auto" }}>
+        <div style={{ padding: "24px", maxWidth: "1300px", margin: "0 auto" }}>
             {/* Header */}
-            <div style={{ marginBottom: "24px" }}>
-                <h1 style={{ fontSize: "24px", fontWeight: "700", color: "#0f172a", margin: 0 }}>
-                    Assign Collection Points
-                </h1>
-                <p style={{ fontSize: "14px", color: "#64748b", margin: "4px 0 0 0" }}>
-                    Select an operation date and vehicle, then choose the collection points to assign. The system automatically enforces date uniqueness and optimizes visiting sequence.
-                </p>
-            </div>
-
-            {/* Notification / Toast Banner */}
-            {message.text && (
-                <div style={{
-                    padding: "14px 18px",
-                    borderRadius: "8px",
-                    marginBottom: "20px",
-                    fontWeight: "600",
-                    fontSize: "14px",
-                    backgroundColor: message.isConflict ? "#fffbeb" : message.isError ? "#fef2f2" : "#f0fdf4",
-                    color: message.isConflict ? "#b45309" : message.isError ? "#dc2626" : "#15803d",
-                    border: `1px solid ${message.isConflict ? "#fde68a" : message.isError ? "#fecaca" : "#bbf7d0"}`
-                }}>
-                    {message.text}
-                </div>
-            )}
-
-            {/* VEHICLES UNDER MAINTENANCE SECTION */}
-            {maintenanceVehicles.length > 0 && (
-                <div style={{ backgroundColor: "#fff5f5", padding: "20px", borderRadius: "12px", border: "1px solid #fecaca", marginBottom: "24px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "10px" }}>
-                        <span style={{ fontSize: "20px" }}>🛠️</span>
-                        <h2 style={{ fontSize: "16px", fontWeight: "700", color: "#991b1b", margin: 0 }}>
-                            Vehicles Under Maintenance ({maintenanceVehicles.length})
-                        </h2>
-                    </div>
-                    <p style={{ fontSize: "13px", color: "#7f1d1d", margin: "0 0 14px 0" }}>
-                        Vehicles under maintenance cannot receive new assignments. Reassign any pending points to an active vehicle below.
-                    </p>
-
-                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                        {maintenanceVehicles.map(matsVeh => (
-                            <div key={matsVeh.id} style={{
-                                backgroundColor: "white",
-                                padding: "14px 18px",
-                                borderRadius: "8px",
-                                border: "1px solid #fca5a5",
-                                display: "flex",
-                                justifyContent: "space-between",
-                                alignItems: "center",
-                                flexWrap: "wrap",
-                                gap: "12px"
-                            }}>
-                                <div>
-                                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                        <span style={{ fontWeight: "800", color: "#991b1b", fontSize: "14px" }}>
-                                            🚛 {matsVeh.vehicle_number}
-                                        </span>
-                                        <span style={{ backgroundColor: "#fee2e2", color: "#b91c1c", padding: "2px 8px", borderRadius: "10px", fontSize: "11px", fontWeight: "700" }}>
-                                            MAINTENANCE (Disabled)
-                                        </span>
-                                        {matsVeh.needsReassignment && (
-                                            <span style={{ backgroundColor: "#fef3c7", color: "#b45309", padding: "2px 8px", borderRadius: "10px", fontSize: "11px", fontWeight: "700" }}>
-                                                ⚠️ Requires Reassignment ({matsVeh.pendingStops.length} points)
-                                            </span>
-                                        )}
-                                    </div>
-                                    <div style={{ fontSize: "12px", color: "#64748b", marginTop: "3px" }}>
-                                        Driver: <strong>{matsVeh.driver_name || "Unassigned"}</strong>
-                                        {matsVeh.needsReassignment && (
-                                            <span style={{ marginLeft: "8px", color: "#b91c1c" }}>
-                                                • Assigned: {matsVeh.pendingStops.map(s => s.point_name).join(", ")}
-                                            </span>
-                                        )}
-                                    </div>
-                                </div>
-
-                                {matsVeh.needsReassignment ? (
-                                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                        <select
-                                            value={reassignTargets[matsVeh.id] || ""}
-                                            onChange={(e) => setReassignTargets({ ...reassignTargets, [matsVeh.id]: e.target.value })}
-                                            style={{ padding: "7px 12px", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "13px" }}
-                                        >
-                                            <option value="">Select Replacement Vehicle</option>
-                                            {eligibleReplacementVehicles.map(v => (
-                                                <option key={v.id} value={v.id}>
-                                                    {v.vehicle_number} ({v.status})
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <button
-                                            onClick={() => handleReassignMaintenance(matsVeh.id)}
-                                            disabled={submitting}
-                                            style={{
-                                                backgroundColor: "#047857",
-                                                color: "white",
-                                                padding: "7px 14px",
-                                                borderRadius: "6px",
-                                                border: "none",
-                                                fontWeight: "600",
-                                                fontSize: "12px",
-                                                cursor: "pointer"
-                                            }}
-                                        >
-                                            Reassign Points
-                                        </button>
-                                    </div>
-                                ) : (
-                                    <div style={{ fontSize: "12px", color: "#15803d", fontWeight: "600" }}>
-                                        ✓ No pending assignments
-                                    </div>
-                                )}
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            )}
-
-            {/* STEP 1 & 2: OPERATION DATE & VEHICLE SELECTION CONTROLS */}
-            <div style={{
-                backgroundColor: "white",
-                padding: "20px 24px",
-                borderRadius: "12px",
-                border: "1px solid #e2e8f0",
-                marginBottom: "20px",
-                display: "flex",
-                gap: "24px",
-                alignItems: "center",
-                flexWrap: "wrap"
-            }}>
-                {/* Operation Date Picker */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "20px", flexWrap: "wrap", gap: "16px" }}>
                 <div>
-                    <label style={{ display: "block", fontSize: "12px", fontWeight: "700", color: "#475569", textTransform: "uppercase", marginBottom: "6px" }}>
-                        Operation Date
-                    </label>
+                    <h1 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", margin: 0 }}>
+                        Permanent Vehicle-to-Area Assignment
+                    </h1>
+                    <p style={{ fontSize: "14px", color: "#64748b", margin: "4px 0 0 0", maxWidth: "800px" }}>
+                        Each vehicle is permanently mapped to its designated service area/ward. All fixed collection points within that ward are automatically assigned and TSP-optimized for daily operations. Daily manual point allocation is not required.
+                    </p>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: "10px", backgroundColor: "white", padding: "8px 14px", borderRadius: "10px", border: "1px solid #cbd5e1" }}>
+                    <span style={{ fontSize: "12px", fontWeight: "700", color: "#475569" }}>📅 Operation Date:</span>
                     <input
                         type="date"
                         value={selectedDate}
-                        onChange={(e) => handleDateChange(e.target.value)}
-                        style={{
-                            padding: "9px 14px",
-                            borderRadius: "6px",
-                            border: "1px solid #cbd5e1",
-                            fontSize: "14px",
-                            fontWeight: "600",
-                            color: "#0f172a"
-                        }}
+                        onChange={(e) => setSelectedDate(e.target.value)}
+                        style={{ border: "1px solid #94a3b8", borderRadius: "6px", padding: "4px 8px", fontSize: "13px", fontWeight: "700", color: "#0f172a" }}
                     />
-                </div>
-
-                {/* Vehicle Selection Dropdown (Starts unselected) */}
-                <div style={{ flex: 1, minWidth: "300px" }}>
-                    <label style={{ display: "block", fontSize: "12px", fontWeight: "700", color: "#475569", textTransform: "uppercase", marginBottom: "6px" }}>
-                        Select Vehicle
-                    </label>
-                    <select
-                        value={selectedVehicleId}
-                        onChange={(e) => handleVehicleChange(e.target.value)}
-                        style={{
-                            width: "100%",
-                            padding: "9px 14px",
-                            borderRadius: "6px",
-                            border: selectedVehicleId ? "2px solid #047857" : "1px solid #cbd5e1",
-                            fontSize: "14px",
-                            fontWeight: "600",
-                            color: selectedVehicleId ? "#0f172a" : "#64748b",
-                            backgroundColor: selectedVehicleId ? "#f0fdf4" : "#ffffff"
-                        }}
-                    >
-                        <option value="">-- Select a Vehicle --</option>
-                        {vehicles.map(v => {
-                            const isMaint = v.status === "MAINTENANCE" || v.status === "INACTIVE";
-                            return (
-                                <option
-                                    key={v.id}
-                                    value={v.id}
-                                    disabled={isMaint}
-                                >
-                                    {v.vehicle_number} — [{isMaint ? "🔧 MAINTENANCE" : "🟢 IN SERVICE"}] — Driver: {v.driver_name || "Unassigned"} {isMaint ? "(🔧 Vehicle under maintenance)" : ""}
-                                </option>
-                            );
-                        })}
-                    </select>
                 </div>
             </div>
 
-            {/* MAINTENANCE VEHICLE WARNING */}
-            {isMaintenance && (
+            {/* Notification Banner */}
+            {message.text && (
                 <div style={{
-                    backgroundColor: "#fef2f2",
-                    color: "#991b1b",
-                    padding: "16px 20px",
+                    padding: "14px 18px",
                     borderRadius: "10px",
-                    border: "1px solid #fecaca",
-                    fontWeight: "700",
-                    fontSize: "14px",
                     marginBottom: "20px",
+                    fontWeight: "600",
+                    fontSize: "14px",
+                    backgroundColor: message.isError ? "#fef2f2" : "#f0fdf4",
+                    color: message.isError ? "#dc2626" : "#15803d",
+                    border: `1px solid ${message.isError ? "#fecaca" : "#bbf7d0"}`,
                     display: "flex",
-                    alignItems: "center",
-                    gap: "10px"
+                    justifyContent: "space-between",
+                    alignItems: "center"
                 }}>
-                    <span style={{ fontSize: "20px" }}>🔧</span>
-                    <span>Vehicle {selectedVehicle.vehicle_number} is under maintenance and cannot receive new collection point assignments.</span>
+                    <span>{message.isError ? "⚠️" : "✓"} {message.text}</span>
+                    <button
+                        onClick={() => setMessage({ text: "", isError: false, type: "success" })}
+                        style={{ background: "transparent", border: "none", cursor: "pointer", color: "#64748b", fontWeight: "700" }}
+                    >
+                        ✕
+                    </button>
                 </div>
             )}
 
-            {/* DYNAMIC AVAILABILITY STATS COUNTERS */}
-            {selectedVehicleId && !isMaintenance && (
-                <div style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                    gap: "16px",
-                    marginBottom: "24px"
-                }}>
-                    <div style={{ backgroundColor: "#f0fdf4", padding: "14px 18px", borderRadius: "10px", border: "1px solid #bbf7d0" }}>
-                        <div style={{ fontSize: "12px", color: "#166534", fontWeight: "700", display: "flex", alignItems: "center", gap: "6px" }}>
-                            <span>🟢</span> Available for assignment:
+            {/* Architecture Explanatory Infobox */}
+            <div style={{
+                backgroundColor: "#f0fdf4",
+                border: "1px solid #bbf7d0",
+                borderRadius: "12px",
+                padding: "16px 20px",
+                marginBottom: "24px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: "12px"
+            }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                    <span style={{ fontSize: "24px" }}>🔄</span>
+                    <div>
+                        <div style={{ fontSize: "14px", fontWeight: "700", color: "#166534" }}>
+                            Automated Daily Waste Operations
                         </div>
-                        <div style={{ fontSize: "26px", fontWeight: "800", color: "#047857", marginTop: "4px" }}>
-                            {counts.available}
-                        </div>
-                    </div>
-
-                    <div style={{ backgroundColor: "#eff6ff", padding: "14px 18px", borderRadius: "10px", border: "1px solid #bfdbfe" }}>
-                        <div style={{ fontSize: "12px", color: "#1e40af", fontWeight: "700", display: "flex", alignItems: "center", gap: "6px" }}>
-                            <span>🔵</span> Assigned to this vehicle:
-                        </div>
-                        <div style={{ fontSize: "26px", fontWeight: "800", color: "#2563eb", marginTop: "4px" }}>
-                            {counts.assigned_to_current}
-                        </div>
-                    </div>
-
-                    <div style={{ backgroundColor: "#f8fafc", padding: "14px 18px", borderRadius: "10px", border: "1px solid #e2e8f0" }}>
-                        <div style={{ fontSize: "12px", color: "#475569", fontWeight: "700", display: "flex", alignItems: "center", gap: "6px" }}>
-                            <span>⚫</span> Assigned to other vehicles:
-                        </div>
-                        <div style={{ fontSize: "26px", fontWeight: "800", color: "#475569", marginTop: "4px" }}>
-                            {counts.assigned_to_other}
+                        <div style={{ fontSize: "13px", color: "#15803d", marginTop: "2px" }}>
+                            <strong>Permanent Model:</strong> Vehicle → Permanent Area/Ward. All assignments persist indefinitely across all dates unless explicitly changed.
                         </div>
                     </div>
                 </div>
-            )}
+                <button
+                    onClick={() => openPermanentModal("")}
+                    style={{
+                        backgroundColor: "#047857",
+                        color: "white",
+                        padding: "9px 16px",
+                        borderRadius: "8px",
+                        border: "none",
+                        fontWeight: "700",
+                        fontSize: "13px",
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        boxShadow: "0 2px 4px rgba(4,120,87,0.2)"
+                    }}
+                >
+                    <span>➕</span>
+                    <span>Assign / Change Permanent Area</span>
+                </button>
+            </div>
 
-            {/* MAIN WORKFLOW AREA */}
-            {!selectedVehicleId ? (
-                /* Empty state when no vehicle is selected */
-                <div style={{
-                    backgroundColor: "white",
-                    padding: "48px 24px",
-                    borderRadius: "12px",
-                    border: "2px dashed #cbd5e1",
-                    textAlign: "center",
-                    color: "#64748b"
-                }}>
-                    <div style={{ fontSize: "40px", marginBottom: "12px" }}>🚛</div>
-                    <h3 style={{ fontSize: "18px", fontWeight: "700", color: "#1e293b", margin: "0 0 8px 0" }}>
-                        Please Select a Vehicle First
-                    </h3>
-                    <p style={{ fontSize: "14px", color: "#64748b", margin: 0, maxWidth: "500px", marginInline: "auto" }}>
-                        Select an active vehicle from the dropdown above to view currently available collection points for <strong>{selectedDate}</strong> and assign points manually.
-                    </p>
+            {/* FLEET PERMANENT VEHICLE ASSIGNMENTS TABLE */}
+            <div style={{ backgroundColor: "white", borderRadius: "14px", border: "1px solid #e2e8f0", boxShadow: "0 2px 6px rgba(0,0,0,0.04)", overflow: "hidden", marginBottom: "28px" }}>
+                <div style={{ padding: "16px 20px", backgroundColor: "#f8fafc", borderBottom: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px" }}>
+                    <div>
+                        <h2 style={{ fontSize: "16px", fontWeight: "800", color: "#0f172a", margin: 0 }}>
+                            Fleet Permanent Area Assignments
+                        </h2>
+                        <span style={{ fontSize: "12px", color: "#64748b" }}>
+                            Stored permanently in the database and automatically applied across all future dates.
+                        </span>
+                    </div>
                 </div>
-            ) : isMaintenance ? (
-                /* Maintenance disabled state */
-                <div style={{
-                    backgroundColor: "white",
-                    padding: "36px 24px",
-                    borderRadius: "12px",
-                    border: "1px solid #fca5a5",
-                    textAlign: "center",
-                    color: "#991b1b"
-                }}>
-                    <div style={{ fontSize: "36px", marginBottom: "10px" }}>🛠️</div>
-                    <h3 style={{ fontSize: "16px", fontWeight: "700", margin: "0 0 6px 0" }}>
-                        Vehicle Under Maintenance
-                    </h3>
-                    <p style={{ fontSize: "13px", color: "#7f1d1d", margin: 0 }}>
-                        Please choose an active vehicle from the dropdown to assign collection points.
-                    </p>
-                </div>
-            ) : (
-                /* Two-column layout for selected vehicle */
-                <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: "24px", alignItems: "start" }}>
-
-                    {/* LEFT PANEL: COLLECTION POINTS SELECTION */}
-                    <div style={{ backgroundColor: "white", padding: "24px", borderRadius: "12px", border: "1px solid #e2e8f0" }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-                            <div>
-                                <h3 style={{ margin: 0, fontSize: "17px", fontWeight: "700", color: "#0f172a" }}>
-                                    Available Collection Points ({counts.available})
-                                </h3>
-                                <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#64748b" }}>
-                                    Select points for <strong>{selectedVehicle.vehicle_number}</strong> on <strong>{selectedDate}</strong>.
-                                </p>
-                            </div>
-                            <div style={{ display: "flex", gap: "6px" }}>
-                                <button
-                                    type="button"
-                                    onClick={handleSelectAllAvailable}
-                                    style={{ padding: "5px 12px", fontSize: "11px", fontWeight: "700", borderRadius: "6px", border: "1px solid #cbd5e1", background: "#f8fafc", cursor: "pointer", color: "#047857" }}
-                                >
-                                    Select All Available
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={handleClearSelection}
-                                    style={{ padding: "5px 12px", fontSize: "11px", fontWeight: "700", borderRadius: "6px", border: "1px solid #cbd5e1", background: "#f8fafc", cursor: "pointer", color: "#64748b" }}
-                                >
-                                    Clear
-                                </button>
-                            </div>
-                        </div>
-
-                        <form onSubmit={handleSaveAssignment}>
-                            <div style={{
-                                display: "flex",
-                                flexDirection: "column",
-                                gap: "8px",
-                                maxHeight: "480px",
-                                overflowY: "auto",
-                                padding: "4px",
-                                marginBottom: "20px"
-                            }}>
-                                {points.length === 0 ? (
-                                    <div style={{ padding: "30px", textAlign: "center", color: "#64748b", fontSize: "13px" }}>
-                                        No collection points found.
-                                    </div>
-                                ) : (
-                                    points.map((p) => {
-                                        const isSelected = selectedPointIds.includes(p.id);
-                                        const isAssignedToOther = p.assignment_status === "ASSIGNED_TO_OTHER";
-                                        const isAssignedToCurrent = p.assignment_status === "ASSIGNED_TO_CURRENT";
-                                        const isAvailable = p.assignment_status === "AVAILABLE";
-
-                                        return (
-                                            <div
-                                                key={p.id}
-                                                onClick={() => togglePointSelect(p)}
+                <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "14px" }}>
+                        <thead>
+                            <tr style={{ backgroundColor: "#f1f5f9", borderBottom: "1px solid #e2e8f0", color: "#475569", fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                                <th style={{ padding: "12px 18px" }}>Vehicle</th>
+                                <th style={{ padding: "12px 18px" }}>Driver</th>
+                                <th style={{ padding: "12px 18px" }}>Permanent Area</th>
+                                <th style={{ padding: "12px 18px" }}>Status</th>
+                                <th style={{ padding: "12px 18px", textAlign: "right" }}>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {vehicles.map(v => {
+                                const isAssigned = Boolean(v.permanent_ward);
+                                return (
+                                    <tr key={v.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                                        <td style={{ padding: "14px 18px", fontWeight: "800", color: "#047857" }}>
+                                            🚛 {v.vehicle_number}
+                                        </td>
+                                        <td style={{ padding: "14px 18px", color: "#334155" }}>
+                                            {v.driver_name || "Unassigned"}
+                                        </td>
+                                        <td style={{ padding: "14px 18px" }}>
+                                            {isAssigned ? (
+                                                <span style={{ fontWeight: "800", color: "#0284c7" }}>
+                                                    📍 {v.permanent_ward}
+                                                </span>
+                                            ) : (
+                                                <span style={{ color: "#dc2626", fontStyle: "italic", fontWeight: "700" }}>
+                                                    Not Assigned
+                                                </span>
+                                            )}
+                                            {v.temporary_ward && (
+                                                <div style={{ fontSize: "11px", color: "#d97706", fontWeight: "700", marginTop: "2px" }}>
+                                                    ⚡ Temp: {v.temporary_ward}
+                                                </div>
+                                            )}
+                                        </td>
+                                        <td style={{ padding: "14px 18px" }}>
+                                            <span style={{
+                                                padding: "3px 10px",
+                                                borderRadius: "12px",
+                                                fontSize: "11px",
+                                                fontWeight: "800",
+                                                backgroundColor: v.status === "MAINTENANCE" ? "#fee2e2" : v.status === "IN_SERVICE" ? "#dbeafe" : "#dcfce7",
+                                                color: v.status === "MAINTENANCE" ? "#b91c1c" : v.status === "IN_SERVICE" ? "#1d4ed8" : "#15803d",
+                                                border: `1px solid ${v.status === "MAINTENANCE" ? "#fca5a5" : v.status === "IN_SERVICE" ? "#bfdbfe" : "#bbf7d0"}`
+                                            }}>
+                                                {v.status || "ACTIVE"}
+                                            </span>
+                                        </td>
+                                        <td style={{ padding: "14px 18px", textAlign: "right" }}>
+                                            <button
+                                                onClick={() => openPermanentModal(v.permanent_ward || "", v.id)}
                                                 style={{
-                                                    padding: "12px 16px",
-                                                    borderRadius: "8px",
-                                                    border: "1px solid",
-                                                    borderColor: isSelected
-                                                        ? "#047857"
-                                                        : isAssignedToOther
-                                                        ? "#e2e8f0"
-                                                        : isAvailable
-                                                        ? "#cbd5e1"
-                                                        : "#e2e8f0",
-                                                    backgroundColor: isSelected
-                                                        ? "#ecfdf5"
-                                                        : isAssignedToOther
-                                                        ? "#f8fafc"
-                                                        : "#ffffff",
-                                                    cursor: isAssignedToOther ? "not-allowed" : "pointer",
-                                                    opacity: isAssignedToOther ? 0.75 : 1,
-                                                    display: "flex",
-                                                    alignItems: "center",
-                                                    justifyContent: "space-between",
-                                                    transition: "all 0.15s ease"
+                                                    backgroundColor: isAssigned ? "#f8fafc" : "#047857",
+                                                    color: isAssigned ? "#0f172a" : "white",
+                                                    border: isAssigned ? "1px solid #cbd5e1" : "none",
+                                                    padding: "6px 14px",
+                                                    borderRadius: "6px",
+                                                    fontSize: "12px",
+                                                    fontWeight: "700",
+                                                    cursor: "pointer"
                                                 }}
                                             >
-                                                <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={isSelected}
-                                                        disabled={isAssignedToOther}
-                                                        onChange={() => { }} // Handled by click container
-                                                        style={{
-                                                            width: "18px",
-                                                            height: "18px",
-                                                            cursor: isAssignedToOther ? "not-allowed" : "pointer",
-                                                            accentColor: "#047857"
-                                                        }}
-                                                    />
-                                                    <div>
-                                                        <div style={{
-                                                            fontWeight: "700",
-                                                            fontSize: "14px",
-                                                            color: isAssignedToOther
-                                                                ? "#64748b"
-                                                                : isSelected
-                                                                ? "#047857"
-                                                                : "#1e293b"
-                                                        }}>
-                                                            {p.name}
+                                                {isAssigned ? "Change Assignment" : "Assign Permanent Area"}
+                                            </button>
+                                        </td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            {loading ? (
+                <div style={{ padding: "40px", textAlign: "center", color: "#64748b", fontSize: "15px", fontWeight: "600" }}>
+                    Loading permanent area mappings and collection points...
+                </div>
+            ) : (
+                /* WARD ASSIGNMENT CARDS */
+                <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+                    {wardData.map((w) => {
+                        const permVeh = w.permanent_vehicle;
+                        const tempVeh = w.temporary_vehicle;
+                        const isUnderMaintenance = w.is_maintenance;
+                        const hasReplacement = w.has_replacement;
+
+                        return (
+                            <div
+                                key={w.ward}
+                                style={{
+                                    backgroundColor: "white",
+                                    borderRadius: "14px",
+                                    border: isUnderMaintenance && !hasReplacement
+                                        ? "2px solid #ef4444"
+                                        : hasReplacement
+                                            ? "2px solid #3b82f6"
+                                            : "1px solid #e2e8f0",
+                                    boxShadow: "0 2px 6px rgba(0,0,0,0.04)",
+                                    overflow: "hidden"
+                                }}
+                            >
+                                {/* Card Top Bar */}
+                                <div style={{
+                                    padding: "16px 20px",
+                                    backgroundColor: isUnderMaintenance && !hasReplacement
+                                        ? "#fff1f2"
+                                        : hasReplacement
+                                            ? "#eff6ff"
+                                            : "#f8fafc",
+                                    borderBottom: "1px solid #e2e8f0",
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    alignItems: "center",
+                                    flexWrap: "wrap",
+                                    gap: "12px"
+                                }}>
+                                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                                        <span style={{ fontSize: "20px" }}>📍</span>
+                                        <div>
+                                            <h2 style={{ fontSize: "18px", fontWeight: "800", color: "#0f172a", margin: 0 }}>
+                                                {w.ward}
+                                            </h2>
+                                            <span style={{ fontSize: "12px", color: "#64748b" }}>
+                                                {w.total_points} Fixed Collection Point{w.total_points !== 1 ? "s" : ""}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    {/* Operating Status Badge & Actions */}
+                                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                                        {isUnderMaintenance && !hasReplacement && (
+                                            <span style={{
+                                                backgroundColor: "#fee2e2",
+                                                color: "#b91c1c",
+                                                padding: "5px 12px",
+                                                borderRadius: "20px",
+                                                fontSize: "12px",
+                                                fontWeight: "800",
+                                                border: "1px solid #fecaca"
+                                            }}>
+                                                ⚠️ VEHICLE UNDER MAINTENANCE (Replacement Required)
+                                            </span>
+                                        )}
+
+                                        {hasReplacement && (
+                                            <span style={{
+                                                backgroundColor: "#dbeafe",
+                                                color: "#1d4ed8",
+                                                padding: "5px 12px",
+                                                borderRadius: "20px",
+                                                fontSize: "12px",
+                                                fontWeight: "800",
+                                                border: "1px solid #bfdbfe"
+                                            }}>
+                                                🔄 TEMPORARY REPLACEMENT ACTIVE ({tempVeh?.vehicle_number})
+                                            </span>
+                                        )}
+
+                                        {!isUnderMaintenance && permVeh && (
+                                            <span style={{
+                                                backgroundColor: "#dcfce7",
+                                                color: "#15803d",
+                                                padding: "5px 12px",
+                                                borderRadius: "20px",
+                                                fontSize: "12px",
+                                                fontWeight: "800",
+                                                border: "1px solid #bbf7d0"
+                                            }}>
+                                                🟢 NORMAL DAILY OPERATION
+                                            </span>
+                                        )}
+
+                                        {/* Action: Configure Permanent Assignment */}
+                                        <button
+                                            onClick={() => openPermanentModal(w.ward, permVeh?.vehicle_id)}
+                                            style={{
+                                                backgroundColor: "#ffffff",
+                                                color: "#0f172a",
+                                                border: "1px solid #cbd5e1",
+                                                padding: "6px 12px",
+                                                borderRadius: "6px",
+                                                fontSize: "12px",
+                                                fontWeight: "700",
+                                                cursor: "pointer"
+                                            }}
+                                        >
+                                            {permVeh ? "🔄 Change Assignment" : "➕ Assign Permanent Area"}
+                                        </button>
+
+                                        {/* Action: Assign Replacement (When Maintenance occurs) */}
+                                        {isUnderMaintenance && !hasReplacement && (
+                                            <button
+                                                onClick={() => openReplacementModal(w)}
+                                                style={{
+                                                    backgroundColor: "#dc2626",
+                                                    color: "white",
+                                                    border: "none",
+                                                    padding: "6px 14px",
+                                                    borderRadius: "6px",
+                                                    fontSize: "12px",
+                                                    fontWeight: "800",
+                                                    cursor: "pointer",
+                                                    boxShadow: "0 2px 4px rgba(220,38,38,0.3)"
+                                                }}
+                                            >
+                                                Assign Replacement Vehicle
+                                            </button>
+                                        )}
+
+                                        {/* Action: End Replacement */}
+                                        {hasReplacement && (
+                                            <button
+                                                onClick={() => handleRemoveReplacement(w.ward)}
+                                                style={{
+                                                    backgroundColor: "#ffffff",
+                                                    color: "#dc2626",
+                                                    border: "1px solid #fca5a5",
+                                                    padding: "6px 12px",
+                                                    borderRadius: "6px",
+                                                    fontSize: "12px",
+                                                    fontWeight: "700",
+                                                    cursor: "pointer"
+                                                }}
+                                            >
+                                                End Replacement
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Card Body: 2 Columns (Vehicle Assignment & Collection Points) */}
+                                <div style={{ padding: "20px", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "20px" }}>
+                                    {/* Left: Vehicle & Driver Information */}
+                                    <div style={{ backgroundColor: "#f8fafc", padding: "16px", borderRadius: "10px", border: "1px solid #e2e8f0" }}>
+                                        <div style={{ fontSize: "12px", fontWeight: "700", color: "#475569", textTransform: "uppercase", marginBottom: "10px", letterSpacing: "0.5px" }}>
+                                            🚛 Permanent Vehicle Mapping
+                                        </div>
+
+                                        {permVeh ? (
+                                            <div>
+                                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                                                    <span style={{ fontSize: "16px", fontWeight: "800", color: "#0f172a" }}>
+                                                        {permVeh.vehicle_number}
+                                                    </span>
+                                                    <span style={{
+                                                        padding: "2px 8px",
+                                                        borderRadius: "10px",
+                                                        fontSize: "11px",
+                                                        fontWeight: "800",
+                                                        backgroundColor: permVeh.vehicle_status === "MAINTENANCE" ? "#fee2e2" : "#dcfce7",
+                                                        color: permVeh.vehicle_status === "MAINTENANCE" ? "#b91c1c" : "#15803d"
+                                                    }}>
+                                                        {permVeh.vehicle_status}
+                                                    </span>
+                                                </div>
+
+                                                <div style={{ fontSize: "13px", color: "#334155", marginBottom: "4px" }}>
+                                                    Driver: <strong>{permVeh.driver_name || "Unassigned"}</strong>
+                                                </div>
+                                                <div style={{ fontSize: "13px", color: "#64748b" }}>
+                                                    Phone: {permVeh.driver_phone || "Not available"}
+                                                </div>
+
+                                                {/* If temporary replacement is active, show temporary vehicle details */}
+                                                {hasReplacement && tempVeh && (
+                                                    <div style={{ marginTop: "14px", paddingTop: "12px", borderTop: "1px dashed #bfdbfe", backgroundColor: "#f0f9ff", padding: "10px", borderRadius: "8px" }}>
+                                                        <div style={{ fontSize: "11px", fontWeight: "800", color: "#1e40af", textTransform: "uppercase" }}>
+                                                            🔄 Active Temporary Replacement (Today)
                                                         </div>
-                                                        <div style={{ fontSize: "12px", color: "#64748b", marginTop: "2px" }}>
-                                                            📍 {p.ward} • {p.address}
+                                                        <div style={{ fontSize: "14px", fontWeight: "800", color: "#1d4ed8", marginTop: "4px" }}>
+                                                            {tempVeh.vehicle_number} (Driver: {tempVeh.driver_name || "Unassigned"})
+                                                        </div>
+                                                        <div style={{ fontSize: "11px", color: "#2563eb", marginTop: "2px" }}>
+                                                            Covering {w.ward} while {permVeh.vehicle_number} is under maintenance.
                                                         </div>
                                                     </div>
-                                                </div>
-
-                                                <div>
-                                                    {isAssignedToOther && (
-                                                        <span style={{
-                                                            fontSize: "11px",
-                                                            fontWeight: "700",
-                                                            padding: "4px 10px",
-                                                            borderRadius: "12px",
-                                                            backgroundColor: "#f1f5f9",
-                                                            color: "#475569",
-                                                            border: "1px solid #cbd5e1"
-                                                        }}>
-                                                            🔒 Assigned to {p.vehicle_number}
-                                                        </span>
-                                                    )}
-                                                    {isAssignedToCurrent && (
-                                                        <span style={{
-                                                            fontSize: "11px",
-                                                            fontWeight: "700",
-                                                            padding: "4px 10px",
-                                                            borderRadius: "12px",
-                                                            backgroundColor: "#dbeafe",
-                                                            color: "#1e40af",
-                                                            border: "1px solid #93c5fd"
-                                                        }}>
-                                                            🔵 Assigned to this vehicle
-                                                        </span>
-                                                    )}
-                                                    {isAvailable && isSelected && (
-                                                        <span style={{
-                                                            fontSize: "11px",
-                                                            fontWeight: "700",
-                                                            padding: "4px 10px",
-                                                            borderRadius: "12px",
-                                                            backgroundColor: "#dcfce7",
-                                                            color: "#15803d",
-                                                            border: "1px solid #86efac"
-                                                        }}>
-                                                            ✓ Selected
-                                                        </span>
-                                                    )}
-                                                    {isAvailable && !isSelected && (
-                                                        <span style={{
-                                                            fontSize: "11px",
-                                                            fontWeight: "700",
-                                                            padding: "4px 10px",
-                                                            borderRadius: "12px",
-                                                            backgroundColor: "#f0fdf4",
-                                                            color: "#166534",
-                                                            border: "1px solid #bbf7d0"
-                                                        }}>
-                                                            🟢 Available
-                                                        </span>
-                                                    )}
-                                                </div>
+                                                )}
                                             </div>
-                                        );
-                                    })
-                                )}
+                                        ) : (
+                                            <div>
+                                                <div style={{ color: "#dc2626", fontSize: "13px", fontWeight: "600", marginBottom: "10px" }}>
+                                                    No permanent vehicle assigned to this area yet.
+                                                </div>
+                                                <button
+                                                    onClick={() => openPermanentModal(w.ward)}
+                                                    style={{
+                                                        backgroundColor: "#047857",
+                                                        color: "white",
+                                                        padding: "6px 12px",
+                                                        borderRadius: "6px",
+                                                        border: "none",
+                                                        fontWeight: "700",
+                                                        fontSize: "12px",
+                                                        cursor: "pointer"
+                                                    }}
+                                                >
+                                                    Assign Permanent Area
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Right: Fixed Collection Points belonging to this Ward */}
+                                    <div style={{ backgroundColor: "#ffffff", padding: "16px", borderRadius: "10px", border: "1px solid #e2e8f0" }}>
+                                        <div style={{ fontSize: "12px", fontWeight: "700", color: "#475569", textTransform: "uppercase", marginBottom: "10px", letterSpacing: "0.5px" }}>
+                                            🗑️ Fixed Ward Collection Points ({w.collection_points.length})
+                                        </div>
+
+                                        <div style={{ maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+                                            {w.collection_points.length === 0 ? (
+                                                <div style={{ fontSize: "13px", color: "#94a3b8" }}>No collection points registered in this ward.</div>
+                                            ) : (
+                                                w.collection_points.map((pt, idx) => (
+                                                    <div
+                                                        key={pt.id}
+                                                        style={{
+                                                            fontSize: "13px",
+                                                            color: "#334155",
+                                                            padding: "6px 10px",
+                                                            backgroundColor: "#f8fafc",
+                                                            borderRadius: "6px",
+                                                            border: "1px solid #f1f5f9",
+                                                            display: "flex",
+                                                            justifyContent: "space-between",
+                                                            alignItems: "center"
+                                                        }}
+                                                    >
+                                                        <span><strong>{idx + 1}. {pt.name}</strong> <span style={{ color: "#64748b", fontSize: "12px" }}>({pt.address})</span></span>
+                                                        <span style={{ fontSize: "11px", color: "#047857", fontWeight: "700", backgroundColor: "#ecfdf5", padding: "2px 6px", borderRadius: "4px" }}>
+                                                            {pt.scheduled_time || "09:00 AM"}
+                                                        </span>
+                                                    </div>
+                                                ))
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+
+            {/* MODAL 1: SET / CHANGE PERMANENT VEHICLE FOR AREA */}
+            {showPermanentModal && (
+                <div style={{
+                    position: "fixed",
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: "rgba(0,0,0,0.5)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    zIndex: 1000,
+                    padding: "20px"
+                }}>
+                    <div style={{
+                        backgroundColor: "white",
+                        borderRadius: "14px",
+                        maxWidth: "540px",
+                        width: "100%",
+                        padding: "26px",
+                        boxShadow: "0 20px 25px -5px rgba(0,0,0,0.15)",
+                        maxHeight: "90vh",
+                        overflowY: "auto"
+                    }}>
+                        {/* Selected vehicle details & availability calculations */}
+                        {(() => {
+                            const selectedVehObj = vehicles.find(v => v.id.toString() === (selectedVehForPerm || "").toString());
+                            const selectedVehCurrentWard = selectedVehObj?.permanent_ward || wardData.find(w => w.permanent_vehicle?.vehicle_id?.toString() === (selectedVehForPerm || "").toString())?.ward || null;
+                            const isAlreadyAssigned = Boolean(selectedVehCurrentWard);
+
+                            // Available wards for this vehicle = wards that are unassigned OR already assigned to this vehicle
+                            const availableWardsForSelectedVeh = wardData.filter(w => {
+                                if (!w.permanent_vehicle) return true;
+                                if (selectedVehForPerm && w.permanent_vehicle.vehicle_id?.toString() === selectedVehForPerm.toString()) return true;
+                                return false;
+                            });
+
+                            const noAvailableAreas = selectedVehForPerm && availableWardsForSelectedVeh.length === 0;
+
+                            return (
+                                <form onSubmit={handleSavePermanentAssignment}>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+                                        <h2 style={{ fontSize: "19px", fontWeight: "800", color: "#0f172a", margin: 0 }}>
+                                            {isAlreadyAssigned ? "Change Permanent Area Assignment" : "Assign Permanent Area"}
+                                        </h2>
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowPermanentModal(false)}
+                                            style={{ background: "transparent", border: "none", fontSize: "20px", cursor: "pointer", color: "#64748b" }}
+                                        >
+                                            ✕
+                                        </button>
+                                    </div>
+
+                                    <p style={{ fontSize: "13px", color: "#64748b", margin: "0 0 16px 0", lineHeight: "1.4" }}>
+                                        {isAlreadyAssigned
+                                            ? `Change the permanent operational area for Vehicle ${selectedVehObj?.vehicle_number || ""}. The previous area will automatically become available for other vehicles.`
+                                            : "Assigning a permanent vehicle to an area creates a default operational relationship that persists indefinitely across all future dates."
+                                        }
+                                    </p>
+
+                                    {/* Step 1: Vehicle Selection */}
+                                    <div style={{ marginBottom: "16px" }}>
+                                        <label style={{ display: "block", fontSize: "13px", fontWeight: "700", color: "#334155", marginBottom: "6px" }}>
+                                            Vehicle
+                                        </label>
+                                        <select
+                                            value={selectedVehForPerm}
+                                            onChange={(e) => handleModalVehChange(e.target.value)}
+                                            required
+                                            style={{
+                                                width: "100%",
+                                                padding: "10px 12px",
+                                                borderRadius: "8px",
+                                                border: "1px solid #cbd5e1",
+                                                fontSize: "14px",
+                                                fontWeight: "600",
+                                                color: "#0f172a",
+                                                backgroundColor: "#ffffff"
+                                            }}
+                                        >
+                                            <option value="">Select Vehicle...</option>
+                                            {vehicles.map(v => {
+                                                const isMaint = v.status === "MAINTENANCE";
+                                                return (
+                                                    <option key={v.id} value={v.id}>
+                                                        {v.vehicle_number} - {v.driver_name || "Unassigned"} ({v.status}) {isMaint ? `[Maintenance]` : v.permanent_ward ? `[Current: ${v.permanent_ward}]` : "[Unassigned]"}
+                                                    </option>
+                                                );
+                                            })}
+                                        </select>
+
+                                        {/* Display Current Permanent Area of Selected Vehicle */}
+                                        {selectedVehForPerm && (
+                                            <div style={{
+                                                marginTop: "8px",
+                                                padding: "8px 12px",
+                                                backgroundColor: selectedVehCurrentWard ? "#f0fdf4" : "#f8fafc",
+                                                borderRadius: "6px",
+                                                border: `1px solid ${selectedVehCurrentWard ? "#bbf7d0" : "#e2e8f0"}`,
+                                                fontSize: "12px",
+                                                display: "flex",
+                                                alignItems: "center",
+                                                justifyContent: "space-between"
+                                            }}>
+                                                <span style={{ color: "#475569", fontWeight: "600" }}>Current Permanent Area:</span>
+                                                {selectedVehCurrentWard ? (
+                                                    <span style={{ color: "#15803d", fontWeight: "800" }}>📍 {selectedVehCurrentWard}</span>
+                                                ) : (
+                                                    <span style={{ color: "#64748b", fontStyle: "italic", fontWeight: "600" }}>Not Assigned</span>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Step 2: Target Area / Ward Selection */}
+                                    <div style={{ marginBottom: "16px" }}>
+                                        <label style={{ display: "block", fontSize: "13px", fontWeight: "700", color: "#334155", marginBottom: "6px" }}>
+                                            {isAlreadyAssigned ? "New Target Area / Ward" : "Target Area / Ward"}
+                                        </label>
+
+                                        {!selectedVehForPerm ? (
+                                            <div style={{
+                                                padding: "10px 12px",
+                                                backgroundColor: "#f8fafc",
+                                                borderRadius: "8px",
+                                                border: "1px solid #e2e8f0",
+                                                color: "#64748b",
+                                                fontSize: "13px"
+                                            }}>
+                                                Please select a vehicle above to view available service areas.
+                                            </div>
+                                        ) : noAvailableAreas ? (
+                                            <div style={{
+                                                padding: "12px 14px",
+                                                backgroundColor: "#fef2f2",
+                                                borderRadius: "8px",
+                                                border: "1px solid #fecaca",
+                                                color: "#b91c1c",
+                                                fontSize: "13px",
+                                                fontWeight: "600"
+                                            }}>
+                                                ⚠️ All areas have been permanently assigned to other vehicles. No unassigned areas available.
+                                            </div>
+                                        ) : (
+                                            <select
+                                                value={selectedWardForPerm}
+                                                onChange={(e) => setSelectedWardForPerm(e.target.value)}
+                                                required
+                                                style={{
+                                                    width: "100%",
+                                                    padding: "10px 12px",
+                                                    borderRadius: "8px",
+                                                    border: "1px solid #cbd5e1",
+                                                    fontSize: "14px",
+                                                    fontWeight: "600",
+                                                    color: "#0f172a",
+                                                    backgroundColor: "#ffffff"
+                                                }}
+                                            >
+                                                <option value="">Select Target Area / Ward...</option>
+                                                {availableWardsForSelectedVeh.map(w => {
+                                                    const isCurrent = w.ward === selectedVehCurrentWard;
+                                                    return (
+                                                        <option key={w.ward} value={w.ward}>
+                                                            📍 {w.ward} ({w.total_points} Collection Points) {isCurrent ? "★ (Current Assignment)" : "✓ (Available)"}
+                                                        </option>
+                                                    );
+                                                })}
+                                            </select>
+                                        )}
+                                    </div>
+
+                                    {/* Step 3: Show Collection Points belonging to the Selected Area */}
+                                    {selectedWardForPerm && (
+                                        <div style={{
+                                            backgroundColor: "#f8fafc",
+                                            border: "1px solid #e2e8f0",
+                                            borderRadius: "10px",
+                                            padding: "12px 14px",
+                                            marginBottom: "16px"
+                                        }}>
+                                            <div style={{ fontSize: "12px", fontWeight: "800", color: "#0f172a", textTransform: "uppercase", marginBottom: "6px" }}>
+                                                🗑️ Fixed Collection Points in {selectedWardForPerm} ({selectedWardPoints.length})
+                                            </div>
+                                            <div style={{ maxHeight: "120px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "4px" }}>
+                                                {selectedWardPoints.length === 0 ? (
+                                                    <div style={{ fontSize: "12px", color: "#94a3b8" }}>No collection points registered in this ward.</div>
+                                                ) : (
+                                                    selectedWardPoints.map((pt, idx) => (
+                                                        <div key={pt.id} style={{ fontSize: "12px", color: "#334155", display: "flex", justifyContent: "space-between" }}>
+                                                            <span><strong>{idx + 1}. {pt.name}</strong> <span style={{ color: "#64748b" }}>({pt.address})</span></span>
+                                                            <span style={{ color: "#047857", fontWeight: "700" }}>{pt.scheduled_time || "09:00 AM"}</span>
+                                                        </div>
+                                                    ))
+                                                )}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Action Buttons */}
+                                    <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px", marginTop: "20px" }}>
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowPermanentModal(false)}
+                                            style={{ backgroundColor: "#f1f5f9", color: "#475569", border: "1px solid #cbd5e1", padding: "10px 16px", borderRadius: "8px", fontWeight: "700", cursor: "pointer" }}
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button
+                                            type="submit"
+                                            disabled={submitting || !selectedVehForPerm || !selectedWardForPerm || noAvailableAreas}
+                                            style={{
+                                                backgroundColor: (submitting || !selectedVehForPerm || !selectedWardForPerm || noAvailableAreas) ? "#94a3b8" : "#047857",
+                                                color: "white",
+                                                border: "none",
+                                                padding: "10px 20px",
+                                                borderRadius: "8px",
+                                                fontWeight: "700",
+                                                cursor: (submitting || !selectedVehForPerm || !selectedWardForPerm || noAvailableAreas) ? "not-allowed" : "pointer",
+                                                boxShadow: (submitting || !selectedVehForPerm || !selectedWardForPerm || noAvailableAreas) ? "none" : "0 2px 4px rgba(4,120,87,0.25)"
+                                            }}
+                                        >
+                                            {submitting
+                                                ? "Saving..."
+                                                : isAlreadyAssigned
+                                                    ? "Change Assignment"
+                                                    : "Assign Permanent Area"
+                                            }
+                                        </button>
+                                    </div>
+                                </form>
+                            );
+                        })()}
+                    </div>
+                </div>
+            )}
+
+            {/* MODAL 2: ASSIGN TEMPORARY REPLACEMENT VEHICLE (MAINTENANCE ONLY) */}
+            {showReplacementModal && maintWardInfo && (
+                <div style={{
+                    position: "fixed",
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: "rgba(0,0,0,0.5)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    zIndex: 1000,
+                    padding: "20px"
+                }}>
+                    <div style={{
+                        backgroundColor: "white",
+                        borderRadius: "14px",
+                        maxWidth: "540px",
+                        width: "100%",
+                        padding: "24px",
+                        boxShadow: "0 20px 25px -5px rgba(0,0,0,0.1)"
+                    }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                <span style={{ fontSize: "22px" }}>⚠️</span>
+                                <h2 style={{ fontSize: "18px", fontWeight: "800", color: "#991b1b", margin: 0 }}>
+                                    Assign Replacement Vehicle
+                                </h2>
+                            </div>
+                            <button
+                                onClick={() => setShowReplacementModal(false)}
+                                style={{ background: "transparent", border: "none", fontSize: "18px", cursor: "pointer", color: "#64748b" }}
+                            >
+                                ✕
+                            </button>
+                        </div>
+
+                        <div style={{ backgroundColor: "#fff1f2", border: "1px solid #fecdd3", borderRadius: "10px", padding: "12px 16px", marginBottom: "16px" }}>
+                            <div style={{ fontSize: "13px", color: "#881337" }}>
+                                <strong>Affected Area:</strong> {maintWardInfo.ward} ({maintWardInfo.total_points} Collection Points)
+                            </div>
+                            <div style={{ fontSize: "13px", color: "#881337", marginTop: "4px" }}>
+                                <strong>Original Vehicle:</strong> {maintWardInfo.permanent_vehicle?.vehicle_number} (Status: <span style={{ fontWeight: "800", color: "#b91c1c" }}>MAINTENANCE</span>)
+                            </div>
+                        </div>
+
+                        <p style={{ fontSize: "13px", color: "#64748b", margin: "0 0 16px 0" }}>
+                            Select an eligible vehicle to temporarily cover waste collection in <strong>{maintWardInfo.ward}</strong>. The permanent mapping of {maintWardInfo.permanent_vehicle?.vehicle_number} remains intact and will resume automatically once returned to service.
+                        </p>
+
+                        <form onSubmit={handleSaveReplacement}>
+                            <div style={{ marginBottom: "20px" }}>
+                                <label style={{ display: "block", fontSize: "13px", fontWeight: "700", color: "#334155", marginBottom: "6px" }}>
+                                    Choose Eligible Replacement Vehicle
+                                </label>
+                                <select
+                                    value={selectedReplacementVehId}
+                                    onChange={(e) => setSelectedReplacementVehId(e.target.value)}
+                                    required
+                                    style={{ width: "100%", padding: "10px 12px", borderRadius: "8px", border: "1px solid #cbd5e1", fontSize: "14px", fontWeight: "600" }}
+                                >
+                                    <option value="">Select an available vehicle...</option>
+                                    {eligibleReplacements
+                                        .filter(v => v.id !== (maintWardInfo.permanent_vehicle?.vehicle_id || maintWardInfo.permanent_vehicle?.id))
+                                        .map(v => (
+                                            <option key={v.id} value={v.id}>
+                                                {v.vehicle_number} - {v.driver_name || "Unassigned"} ({v.status}) {v.permanent_ward ? `[Permanent: ${v.permanent_ward}]` : ""}
+                                            </option>
+                                        ))
+                                    }
+                                </select>
                             </div>
 
-                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid #f1f5f9", paddingTop: "16px" }}>
-                                <div style={{ fontSize: "13px", color: "#64748b" }}>
-                                    <strong>{selectedPointIds.length}</strong> collection points selected
-                                </div>
+                            <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowReplacementModal(false)}
+                                    style={{ backgroundColor: "#f1f5f9", color: "#475569", border: "1px solid #cbd5e1", padding: "10px 16px", borderRadius: "8px", fontWeight: "700", cursor: "pointer" }}
+                                >
+                                    Cancel
+                                </button>
                                 <button
                                     type="submit"
-                                    disabled={submitting || selectedPointIds.length === 0 || !selectedVehicleId}
-                                    style={{
-                                        backgroundColor: (submitting || selectedPointIds.length === 0 || !selectedVehicleId) ? "#94a3b8" : "#047857",
-                                        color: "white",
-                                        padding: "11px 24px",
-                                        borderRadius: "8px",
-                                        border: "none",
-                                        fontWeight: "700",
-                                        fontSize: "14px",
-                                        cursor: (submitting || selectedPointIds.length === 0 || !selectedVehicleId) ? "not-allowed" : "pointer"
-                                    }}
+                                    disabled={submitting}
+                                    style={{ backgroundColor: "#dc2626", color: "white", border: "none", padding: "10px 18px", borderRadius: "8px", fontWeight: "700", cursor: "pointer" }}
                                 >
-                                    {submitting
-                                        ? "Optimizing Route..."
-                                        : `ASSIGN TO ${selectedVehicle ? selectedVehicle.vehicle_number : "VEHICLE"}`}
+                                    {submitting ? "Assigning Replacement..." : "Confirm Temporary Replacement"}
                                 </button>
                             </div>
                         </form>
                     </div>
-
-                    {/* RIGHT PANEL: CURRENT VEHICLE ASSIGNMENTS & SYSTEM OPTIMIZED SEQUENCE */}
-                    <div style={{ backgroundColor: "white", padding: "24px", borderRadius: "12px", border: "1px solid #e2e8f0" }}>
-                        <div style={{ marginBottom: "16px" }}>
-                            <h3 style={{ margin: 0, fontSize: "17px", fontWeight: "700", color: "#0f172a" }}>
-                                Current Vehicle Assignments
-                            </h3>
-                            <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#64748b" }}>
-                                Vehicle: <strong>{selectedVehicle.vehicle_number}</strong> ({selectedVehicle.status})
-                            </p>
-                        </div>
-
-                        <div style={{ backgroundColor: "#f8fafc", padding: "14px", borderRadius: "8px", border: "1px solid #e2e8f0", marginBottom: "16px" }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                                <span style={{ fontWeight: "700", color: "#047857", fontSize: "15px" }}>
-                                    🚛 {selectedVehicle.vehicle_number}
-                                </span>
-                                <span style={{ fontSize: "12px", color: "#64748b" }}>
-                                    Assigned Stops: <strong>{optimizedRoute ? optimizedRoute.stops.length : 0}</strong>
-                                </span>
-                            </div>
-                            {optimizedRoute && optimizedRoute.route && (
-                                <div style={{ display: "flex", gap: "16px", fontSize: "12px", color: "#475569", marginTop: "6px" }}>
-                                    <div>Total Distance: <strong>{optimizedRoute.route.total_distance || 0} km</strong></div>
-                                    <div>Estimated Time: <strong>{optimizedRoute.route.estimated_time || 0} mins</strong></div>
-                                </div>
-                            )}
-                        </div>
-
-                        {(!optimizedRoute || optimizedRoute.stops.length === 0) ? (
-                            <div style={{
-                                padding: "36px 20px",
-                                textAlign: "center",
-                                backgroundColor: "#f8fafc",
-                                borderRadius: "8px",
-                                border: "1px dashed #cbd5e1",
-                                color: "#64748b",
-                                fontSize: "13px"
-                            }}>
-                                No collection points currently assigned to <strong>{selectedVehicle.vehicle_number}</strong> for {selectedDate}.<br />
-                                Select available points on the left and click <strong>"ASSIGN TO {selectedVehicle.vehicle_number}"</strong>.
-                            </div>
-                        ) : (
-                            <div style={{ display: "flex", flexDirection: "column", gap: "10px", maxHeight: "430px", overflowY: "auto", padding: "2px" }}>
-                                {/* Starting depot / GPS location */}
-                                <div style={{
-                                    display: "flex",
-                                    alignItems: "center",
-                                    gap: "12px",
-                                    padding: "10px 14px",
-                                    borderRadius: "8px",
-                                    backgroundColor: "#f0fdf4",
-                                    border: "1px solid #bbf7d0"
-                                }}>
-                                    <div style={{
-                                        width: "28px",
-                                        height: "28px",
-                                        borderRadius: "50%",
-                                        backgroundColor: "#16a34a",
-                                        color: "white",
-                                        display: "flex",
-                                        alignItems: "center",
-                                        justifyContent: "center",
-                                        fontSize: "14px"
-                                    }}>
-                                        🚛
-                                    </div>
-                                    <div>
-                                        <div style={{ fontSize: "13px", fontWeight: "700", color: "#166534" }}>
-                                            Starting Location
-                                        </div>
-                                        <div style={{ fontSize: "11px", color: "#64748b" }}>
-                                            Vehicle Depot / Live GPS start coordinate
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {/* Sequenced stops */}
-                                {optimizedRoute.stops.map((stop, idx) => (
-                                    <div
-                                        key={stop.id || stop.route_stop_id || idx}
-                                        style={{
-                                            display: "flex",
-                                            alignItems: "center",
-                                            gap: "12px",
-                                            padding: "10px 14px",
-                                            borderRadius: "8px",
-                                            backgroundColor: "#ffffff",
-                                            border: "1px solid #e2e8f0"
-                                        }}
-                                    >
-                                        <div style={{
-                                            width: "28px",
-                                            height: "28px",
-                                            borderRadius: "50%",
-                                            backgroundColor: "#047857",
-                                            color: "white",
-                                            display: "flex",
-                                            alignItems: "center",
-                                            justifyContent: "center",
-                                            fontWeight: "700",
-                                            fontSize: "13px",
-                                            flexShrink: 0
-                                        }}>
-                                            {stop.sequence || idx + 1}
-                                        </div>
-                                        <div style={{ flex: 1 }}>
-                                            <div style={{ fontSize: "14px", fontWeight: "700", color: "#1e293b" }}>
-                                                {stop.name || stop.point_name}
-                                            </div>
-                                            <div style={{ fontSize: "12px", color: "#64748b" }}>
-                                                📍 {stop.address || stop.ward}
-                                            </div>
-                                        </div>
-                                        <span style={{
-                                            fontSize: "11px",
-                                            fontWeight: "600",
-                                            padding: "2px 8px",
-                                            borderRadius: "10px",
-                                            backgroundColor: stop.status === "COMPLETED" ? "#dcfce7" : stop.status === "MISSED" ? "#fee2e2" : "#f1f5f9",
-                                            color: stop.status === "COMPLETED" ? "#15803d" : stop.status === "MISSED" ? "#b91c1c" : "#475569"
-                                        }}>
-                                            {stop.status || "PENDING"}
-                                        </span>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-
                 </div>
             )}
         </div>

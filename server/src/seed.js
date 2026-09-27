@@ -130,11 +130,12 @@ async function seedDatabase() {
         ];
 
         for (const cp of collectionPointsData) {
-            const existing = await pool.query(`SELECT id FROM collection_points WHERE name = $1`, [cp.name]);
+            const existing = await pool.query(`SELECT id FROM collection_points WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) AND LOWER(TRIM(ward)) = LOWER(TRIM($2))`, [cp.name, cp.ward]);
             if (existing.rows.length === 0) {
                 await pool.query(`
                     INSERT INTO collection_points (name, address, ward, latitude, longitude, scheduled_time)
-                    VALUES ($1, $2, $3, $4, $5, $6);
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT DO NOTHING;
                 `, [cp.name, cp.address, cp.ward, cp.lat, cp.lon, cp.time]);
             }
         }

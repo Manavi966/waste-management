@@ -3,6 +3,7 @@ const pool = require("../config/db");
 const { optimizeRoute } = require("../services/routeOptimizer");
 
 const router = express.Router();
+const { syncDailyRoutesForDate } = require("../services/dailyOperationService");
 
 /**
  * Helper function to optimize and persist the visiting sequence for a given route
@@ -145,14 +146,36 @@ router.get("/driver/my-route", async (req, res) => {
 
         const dateStr = date || new Date().toISOString().split("T")[0];
 
-        // 1. Find vehicle assigned to driver
+        // Ensure routes are synced for the driver's vehicle on this date
+        await syncDailyRoutesForDate(dateStr);
+
+        // 1. Find vehicle assigned to driver with permanent and temporary ward assignments
         const vehRes = await pool.query(
             `SELECT v.id, v.vehicle_number, v.status, v.current_latitude, v.current_longitude,
-                    u.name AS driver_name, u.phone AS driver_phone
+                    u.name AS driver_name, u.phone AS driver_phone,
+                    (
+                        SELECT vaa.ward 
+                        FROM vehicle_area_assignments vaa 
+                        WHERE vaa.vehicle_id = v.id 
+                          AND vaa.assignment_type = 'PERMANENT' 
+                          AND vaa.is_active = TRUE 
+                        LIMIT 1
+                    ) AS permanent_ward,
+                    (
+                        SELECT vaa.ward 
+                        FROM vehicle_area_assignments vaa 
+                        WHERE vaa.vehicle_id = v.id 
+                          AND vaa.assignment_type = 'TEMPORARY' 
+                          AND vaa.is_active = TRUE 
+                          AND vaa.start_date <= $2::date 
+                          AND (vaa.end_date IS NULL OR vaa.end_date >= $2::date)
+                        ORDER BY vaa.id DESC 
+                        LIMIT 1
+                    ) AS temporary_ward
              FROM vehicles v
              JOIN users u ON v.driver_id = u.id
              WHERE v.driver_id = $1`,
-            [driver_id]
+            [driver_id, dateStr]
         );
 
         if (vehRes.rows.length === 0) {
@@ -183,7 +206,7 @@ router.get("/driver/my-route", async (req, res) => {
         if (routeRes.rows.length > 0) {
             route = routeRes.rows[0];
 
-            // 3. Get route stops in sequence order
+            // 3. Get route stops in sequence order with collection zone parameters
             const stopsRes = await pool.query(
                 `SELECT 
                     rs.id,
@@ -193,13 +216,20 @@ router.get("/driver/my-route", async (req, res) => {
                     rs.actual_arrival,
                     rs.actual_departure,
                     rs.miss_reason,
+                    rs.dwell_start_time,
+                    rs.last_gps_inside_at,
+                    rs.scanned_count,
+                    rs.verification_status,
                     cp.id AS collection_point_id,
                     cp.name,
                     cp.address,
                     cp.ward,
                     cp.latitude,
                     cp.longitude,
-                    cp.scheduled_time
+                    cp.scheduled_time,
+                    COALESCE(cp.minimum_collection_time_seconds, 30) AS minimum_collection_time_seconds,
+                    COALESCE(cp.total_scanners, 3) AS total_scanners,
+                    COALESCE(cp.geofence_radius_meters, 100) AS geofence_radius_meters
                  FROM route_stops rs
                  JOIN collection_points cp ON rs.collection_point_id = cp.id
                  WHERE rs.route_id = $1
@@ -207,24 +237,95 @@ router.get("/driver/my-route", async (req, res) => {
                 [route.id]
             );
 
-            stops = stopsRes.rows.map(s => ({
-                id: s.id,
-                sequence: s.sequence,
-                status: s.status,
-                expected_arrival: s.expected_arrival,
-                actual_arrival: s.actual_arrival,
-                actual_departure: s.actual_departure,
-                miss_reason: s.miss_reason,
-                collection_point: {
-                    id: s.collection_point_id,
-                    name: s.name,
-                    address: s.address,
-                    ward: s.ward,
-                    latitude: Number(s.latitude),
-                    longitude: Number(s.longitude),
-                    scheduled_time: s.scheduled_time || "09:00 AM"
+            // Fetch all checkpoints and scan records for each stop
+            const stopDetails = [];
+            for (const s of stopsRes.rows) {
+                const checkpointsRes = await pool.query(
+                    `SELECT 
+                        sc.id,
+                        sc.scanner_code,
+                        sc.name,
+                        sc.sequence,
+                        sc.latitude,
+                        sc.longitude,
+                        sc.status,
+                        sr.id AS scan_record_id,
+                        sr.scanned_at,
+                        sr.verification_status,
+                        CASE WHEN sr.id IS NOT NULL AND sr.verification_status = 'VERIFIED' THEN TRUE ELSE FALSE END AS is_scanned
+                     FROM scanner_checkpoints sc
+                     LEFT JOIN scanner_scan_records sr 
+                       ON sc.id = sr.scanner_id 
+                      AND sr.route_stop_id = $1 
+                      AND sr.verification_status = 'VERIFIED'
+                     WHERE sc.collection_point_id = $2
+                     ORDER BY sc.sequence ASC, sc.id ASC`,
+                    [s.id, s.collection_point_id]
+                );
+
+                const checkpoints = checkpointsRes.rows;
+                const totalCheckpoints = checkpoints.length || s.total_scanners || 3;
+                const scannedCheckpoints = checkpoints.filter(c => c.is_scanned).length;
+
+                const minCollectionSec = Number(s.minimum_collection_time_seconds) || 30;
+                let elapsedDwellSec = 0;
+                let isDwellCompleted = false;
+
+                if (s.status === "COMPLETED") {
+                    elapsedDwellSec = minCollectionSec;
+                    isDwellCompleted = true;
+                } else if (s.dwell_start_time) {
+                    elapsedDwellSec = Math.max(0, Math.floor((Date.now() - new Date(s.dwell_start_time).getTime()) / 1000));
+                    isDwellCompleted = elapsedDwellSec >= minCollectionSec;
                 }
-            }));
+
+                let derivedZoneStatus = "NOT_STARTED";
+                if (s.status === "COMPLETED") {
+                    derivedZoneStatus = "COMPLETED";
+                } else if (s.status === "MISSED") {
+                    derivedZoneStatus = "MISSED";
+                } else if (s.verification_status === "DWELL_RESET") {
+                    derivedZoneStatus = "DWELL_RESET";
+                } else if (isDwellCompleted && scannedCheckpoints >= totalCheckpoints) {
+                    derivedZoneStatus = "READY_FOR_COMPLETION";
+                } else if (s.dwell_start_time || scannedCheckpoints > 0 || s.status === "IN_PROGRESS") {
+                    derivedZoneStatus = "IN_PROGRESS";
+                }
+
+                stopDetails.push({
+                    id: s.id,
+                    sequence: s.sequence,
+                    status: s.status,
+                    expected_arrival: s.expected_arrival,
+                    actual_arrival: s.actual_arrival,
+                    actual_departure: s.actual_departure,
+                    miss_reason: s.miss_reason,
+                    dwell_start_time: s.dwell_start_time,
+                    elapsed_dwell_seconds: elapsedDwellSec,
+                    minimum_collection_time_seconds: minCollectionSec,
+                    dwell_completed: isDwellCompleted,
+                    scanned_count: scannedCheckpoints,
+                    total_scanners: totalCheckpoints,
+                    progress_text: `${scannedCheckpoints}/${totalCheckpoints}`,
+                    all_scanners_scanned: scannedCheckpoints >= totalCheckpoints && totalCheckpoints > 0,
+                    zone_status: derivedZoneStatus,
+                    checkpoints: checkpoints,
+                    collection_point: {
+                        id: s.collection_point_id,
+                        name: s.name,
+                        address: s.address,
+                        ward: s.ward,
+                        latitude: Number(s.latitude),
+                        longitude: Number(s.longitude),
+                        scheduled_time: s.scheduled_time || "09:00 AM",
+                        minimum_collection_time_seconds: minCollectionSec,
+                        total_scanners: totalCheckpoints,
+                        geofence_radius_meters: s.geofence_radius_meters || 100
+                    }
+                });
+            }
+
+            stops = stopDetails;
         }
 
         // 4. Latest GPS position for vehicle
@@ -266,20 +367,26 @@ router.get("/driver/my-route", async (req, res) => {
         let nextStopInfo = null;
 
         if (nextPendingStop) {
-            let distanceToNextKm = null;
+            let distanceToNextMeters = null;
+            let isInsideGeofence = false;
+
             if (gps && nextPendingStop.collection_point.latitude && nextPendingStop.collection_point.longitude) {
                 const { calculateHaversineDistance } = require("../services/trafficService");
-                distanceToNextKm = Number(calculateHaversineDistance(
+                const distKm = calculateHaversineDistance(
                     gps.latitude,
                     gps.longitude,
                     nextPendingStop.collection_point.latitude,
                     nextPendingStop.collection_point.longitude
-                ).toFixed(2));
+                );
+                distanceToNextMeters = Math.round(distKm * 1000);
+                isInsideGeofence = distanceToNextMeters <= (nextPendingStop.collection_point.geofence_radius_meters || 100);
             }
 
             nextStopInfo = {
                 ...nextPendingStop,
-                distance_from_vehicle_km: distanceToNextKm
+                distance_from_vehicle_km: distanceToNextMeters !== null ? Number((distanceToNextMeters / 1000).toFixed(2)) : null,
+                distance_from_vehicle_meters: distanceToNextMeters,
+                is_inside_geofence: isInsideGeofence
             };
         }
 
@@ -294,8 +401,11 @@ router.get("/driver/my-route", async (req, res) => {
                 vehicle_number: vehicle.vehicle_number,
                 status: vehicle.status,
                 driver_name: vehicle.driver_name,
-                driver_phone: vehicle.driver_phone
+                driver_phone: vehicle.driver_phone,
+                permanent_ward: vehicle.permanent_ward || null,
+                temporary_ward: vehicle.temporary_ward || null
             },
+            permanent_assigned_area: vehicle.permanent_ward || "Not Assigned",
             route: route ? {
                 id: route.id,
                 route_date: route.route_date,
@@ -452,36 +562,26 @@ router.post("/:routeId/start", async (req, res) => {
 });
 
 // ----------------------------------------------------
-// POST /api/routes/stops/:stopId/complete
+// POST /api/routes/stops/:stopId/arrive
+// Vehicle enters collection zone geofence and starts dwell timer
 // ----------------------------------------------------
-router.post("/stops/:stopId/complete", async (req, res) => {
+router.post("/stops/:stopId/arrive", async (req, res) => {
     try {
         const { stopId } = req.params;
         const { latitude, longitude, accuracy, driver_id } = req.body;
-
-        if (latitude === undefined || longitude === undefined || isNaN(Number(latitude)) || isNaN(Number(longitude))) {
-            return res.status(400).json({
-                message: "Current GPS location (latitude and longitude) is required."
-            });
-        }
-
-        // GPS Accuracy check: if browser/device reports high inaccuracy (> 100m)
-        if (accuracy !== undefined && accuracy !== null && Number(accuracy) > 100) {
-            return res.status(400).json({
-                message: "GPS accuracy is too low. Please wait for a better GPS signal.",
-                accuracy: Number(accuracy)
-            });
-        }
 
         const stopResult = await pool.query(
             `SELECT
                 rs.id,
                 rs.status,
-                rs.route_id,
-                rs.collection_point_id,
+                rs.dwell_start_time,
+                rs.verification_status,
+                cp.id AS collection_point_id,
                 cp.name,
                 cp.latitude,
                 cp.longitude,
+                COALESCE(cp.minimum_collection_time_seconds, 30) AS minimum_collection_time_seconds,
+                COALESCE(cp.geofence_radius_meters, 100) AS geofence_radius_meters,
                 r.vehicle_id,
                 v.vehicle_number,
                 v.driver_id
@@ -494,61 +594,455 @@ router.post("/stops/:stopId/complete", async (req, res) => {
         );
 
         if (stopResult.rows.length === 0) {
-            return res.status(404).json({
-                message: "Route stop not found."
-            });
+            return res.status(404).json({ message: "Route stop not found." });
         }
 
         const stop = stopResult.rows[0];
 
-        // Verify stop is currently PENDING
+        if (stop.status === "COMPLETED") {
+            return res.status(400).json({ message: `Collection at ${stop.name} is already completed.` });
+        }
+
+        if (driver_id && stop.driver_id && stop.driver_id.toString() !== driver_id.toString()) {
+            return res.status(403).json({ message: "Unauthorized: Stop assigned to another vehicle/driver." });
+        }
+
+        let distanceMeters = 0;
+        if (latitude !== undefined && longitude !== undefined && !isNaN(Number(latitude)) && !isNaN(Number(longitude))) {
+            const { calculateHaversineDistance } = require("../services/trafficService");
+            const distKm = calculateHaversineDistance(
+                Number(latitude),
+                Number(longitude),
+                Number(stop.latitude),
+                Number(stop.longitude)
+            );
+            distanceMeters = Math.round(distKm * 1000);
+
+            const maxDistance = stop.geofence_radius_meters || 100;
+            if (distanceMeters > maxDistance) {
+                return res.status(400).json({
+                    message: `Vehicle is outside the allowed collection zone. You are ${distanceMeters}m away from ${stop.name}. Must be within ${maxDistance}m.`,
+                    distance_meters: distanceMeters,
+                    required_distance: maxDistance
+                });
+            }
+        }
+
+        // Initialize dwell timer if not started or was reset
+        let dwellStart = stop.dwell_start_time;
+        if (!dwellStart) {
+            const updRes = await pool.query(
+                `UPDATE route_stops
+                 SET
+                    dwell_start_time = CURRENT_TIMESTAMP,
+                    actual_arrival = COALESCE(actual_arrival, CURRENT_TIMESTAMP),
+                    last_gps_inside_at = CURRENT_TIMESTAMP,
+                    verification_status = 'IN_PROGRESS'
+                 WHERE id = $1
+                 RETURNING *`,
+                [stopId]
+            );
+            dwellStart = updRes.rows[0].dwell_start_time;
+        }
+
+        const minCollectionSec = Number(stop.minimum_collection_time_seconds) || 30;
+        const elapsedSec = Math.max(0, Math.floor((Date.now() - new Date(dwellStart).getTime()) / 1000));
+
+        res.json({
+            message: `Arrival confirmed at ${stop.name}. Collection timer active.`,
+            stop_id: stop.id,
+            zone_name: stop.name,
+            dwell_start_time: dwellStart,
+            elapsed_dwell_seconds: elapsedSec,
+            minimum_collection_time_seconds: minCollectionSec,
+            distance_meters: distanceMeters,
+            is_inside_geofence: true
+        });
+
+    } catch (error) {
+        console.error("Stop arrive error:", error);
+        res.status(500).json({ message: "Failed to record arrival at collection zone." });
+    }
+});
+
+// ----------------------------------------------------
+// POST /api/routes/stops/:stopId/scan
+// Scan a specific checkpoint scanner within a collection zone
+// ----------------------------------------------------
+router.post("/stops/:stopId/scan", async (req, res) => {
+    try {
+        const { stopId } = req.params;
+        const { scanner_code, latitude, longitude, accuracy, driver_id, vehicle_id } = req.body;
+
+        if (!scanner_code || scanner_code.trim() === "") {
+            return res.status(400).json({ message: "scanner_code is required." });
+        }
+
+        const cleanScannerCode = scanner_code.trim().toUpperCase();
+
+        const stopResult = await pool.query(
+            `SELECT
+                rs.id,
+                rs.status,
+                rs.route_id,
+                rs.dwell_start_time,
+                rs.verification_status,
+                cp.id AS collection_point_id,
+                cp.name,
+                cp.latitude,
+                cp.longitude,
+                COALESCE(cp.minimum_collection_time_seconds, 30) AS minimum_collection_time_seconds,
+                COALESCE(cp.total_scanners, 3) AS total_scanners,
+                COALESCE(cp.geofence_radius_meters, 100) AS geofence_radius_meters,
+                r.vehicle_id,
+                r.route_date,
+                v.vehicle_number,
+                v.driver_id
+             FROM route_stops rs
+             JOIN collection_points cp ON rs.collection_point_id = cp.id
+             JOIN routes r ON rs.route_id = r.id
+             JOIN vehicles v ON r.vehicle_id = v.id
+             WHERE rs.id = $1`,
+            [stopId]
+        );
+
+        if (stopResult.rows.length === 0) {
+            return res.status(404).json({ message: "Route stop not found." });
+        }
+
+        const stop = stopResult.rows[0];
+
+        if (stop.status === "COMPLETED") {
+            return res.status(400).json({ message: `Collection at ${stop.name} has already been completed.` });
+        }
+
+        if (driver_id && stop.driver_id && stop.driver_id.toString() !== driver_id.toString()) {
+            return res.status(403).json({ message: "Unauthorized: Stop assigned to another vehicle/driver." });
+        }
+
+        // 1. GPS Geofence Check
+        let distanceMeters = 0;
+        if (latitude !== undefined && longitude !== undefined && !isNaN(Number(latitude)) && !isNaN(Number(longitude))) {
+            const { calculateHaversineDistance } = require("../services/trafficService");
+            const distKm = calculateHaversineDistance(
+                Number(latitude),
+                Number(longitude),
+                Number(stop.latitude),
+                Number(stop.longitude)
+            );
+            distanceMeters = Math.round(distKm * 1000);
+
+            const maxDistance = stop.geofence_radius_meters || 100;
+            if (distanceMeters > maxDistance) {
+                return res.status(400).json({
+                    message: `Vehicle is outside the allowed collection zone. You are ${distanceMeters}m away from ${stop.name}. Must be within ${maxDistance}m to scan.`,
+                    distance_meters: distanceMeters,
+                    required_distance: maxDistance
+                });
+            }
+        }
+
+        // 2. Validate Scanner Code belongs to this Collection Zone
+        let scannerRes = await pool.query(
+            `SELECT * FROM scanner_checkpoints 
+             WHERE collection_point_id = $1 
+               AND (UPPER(scanner_code) = $2 OR UPPER(name) = $2 OR sequence::text = $2 OR id::text = $2)`,
+            [stop.collection_point_id, cleanScannerCode]
+        );
+
+        if (scannerRes.rows.length === 0) {
+            // Check if it belongs to another collection zone
+            const otherZoneRes = await pool.query(
+                `SELECT sc.*, cp.name AS zone_name FROM scanner_checkpoints sc
+                 JOIN collection_points cp ON sc.collection_point_id = cp.id
+                 WHERE UPPER(sc.scanner_code) = $1 OR UPPER(sc.name) = $1 OR sc.id::text = $1`,
+                [cleanScannerCode]
+            );
+
+            if (otherZoneRes.rows.length > 0) {
+                const other = otherZoneRes.rows[0];
+                return res.status(400).json({
+                    message: `Scanner does not belong to this collection zone. (${other.scanner_code} belongs to ${other.zone_name})`
+                });
+            }
+
+            return res.status(400).json({
+                message: `Invalid scanner code '${scanner_code}'. Checkpoint does not exist.`
+            });
+        }
+
+        const scanner = scannerRes.rows[0];
+
+        // 3. Check duplicate scan for this route stop
+        const existingScanRes = await pool.query(
+            `SELECT id, scanned_at FROM scanner_scan_records 
+             WHERE route_stop_id = $1 AND scanner_id = $2 AND verification_status = 'VERIFIED'`,
+            [stop.id, scanner.id]
+        );
+
+        if (existingScanRes.rows.length > 0) {
+            return res.status(400).json({
+                message: `This checkpoint has already been scanned. (${scanner.name})`
+            });
+        }
+
+        // 4. Auto-start Dwell Timer if not active
+        let dwellStart = stop.dwell_start_time;
+        if (!dwellStart) {
+            await pool.query(
+                `UPDATE route_stops
+                 SET
+                    dwell_start_time = CURRENT_TIMESTAMP,
+                    actual_arrival = COALESCE(actual_arrival, CURRENT_TIMESTAMP),
+                    last_gps_inside_at = CURRENT_TIMESTAMP,
+                    verification_status = 'IN_PROGRESS'
+                 WHERE id = $1`,
+                [stop.id]
+            );
+            dwellStart = new Date().toISOString();
+        }
+
+        // 5. Insert Scan Record
+        const scanLat = latitude !== undefined ? Number(latitude) : Number(scanner.latitude || stop.latitude);
+        const scanLon = longitude !== undefined ? Number(longitude) : Number(scanner.longitude || stop.longitude);
+
+        const insertScanRes = await pool.query(
+            `INSERT INTO scanner_scan_records 
+             (scanner_id, collection_point_id, vehicle_id, route_stop_id, route_date, scanned_at, gps_latitude, gps_longitude, distance_meters, verification_status)
+             VALUES ($1, $2, $3, $4, $5::date, CURRENT_TIMESTAMP, $6, $7, $8, 'VERIFIED')
+             RETURNING *`,
+            [
+                scanner.id,
+                stop.collection_point_id,
+                stop.vehicle_id,
+                stop.id,
+                stop.route_date || new Date().toISOString().split("T")[0],
+                scanLat,
+                scanLon,
+                distanceMeters
+            ]
+        );
+
+        // 6. Get updated counts
+        const allCheckpointsRes = await pool.query(
+            `SELECT 
+                sc.id,
+                sc.scanner_code,
+                sc.name,
+                sc.sequence,
+                sc.status,
+                sr.id AS scan_record_id,
+                sr.scanned_at,
+                sr.verification_status,
+                CASE WHEN sr.id IS NOT NULL AND sr.verification_status = 'VERIFIED' THEN TRUE ELSE FALSE END AS is_scanned
+             FROM scanner_checkpoints sc
+             LEFT JOIN scanner_scan_records sr 
+               ON sc.id = sr.scanner_id 
+              AND sr.route_stop_id = $1 
+              AND sr.verification_status = 'VERIFIED'
+             WHERE sc.collection_point_id = $2
+             ORDER BY sc.sequence ASC`,
+            [stop.id, stop.collection_point_id]
+        );
+
+        const checkpoints = allCheckpointsRes.rows;
+        const totalCount = checkpoints.length || stop.total_scanners || 3;
+        const scannedCount = checkpoints.filter(c => c.is_scanned).length;
+
+        const minCollectionSec = Number(stop.minimum_collection_time_seconds) || 30;
+        const elapsedDwellSec = Math.max(0, Math.floor((Date.now() - new Date(dwellStart).getTime()) / 1000));
+        const isDwellCompleted = elapsedDwellSec >= minCollectionSec;
+        const allScanned = scannedCount >= totalCount;
+        const readyForCompletion = allScanned && isDwellCompleted;
+
+        // Update scanned count in route_stops
+        if (readyForCompletion) {
+            await pool.query(
+                `UPDATE route_stops 
+                 SET scanned_count = $1, last_gps_inside_at = CURRENT_TIMESTAMP, verification_status = 'VERIFIED', status = 'COMPLETED', actual_departure = CURRENT_TIMESTAMP 
+                 WHERE id = $2`,
+                [scannedCount, stop.id]
+            );
+        } else {
+            await pool.query(
+                `UPDATE route_stops 
+                 SET scanned_count = $1, last_gps_inside_at = CURRENT_TIMESTAMP, verification_status = 'IN_PROGRESS' 
+                 WHERE id = $2`,
+                [scannedCount, stop.id]
+            );
+        }
+
+        // Activity log
+        await pool.query(
+            `INSERT INTO activity_logs (event_type, description, vehicle_id)
+             VALUES ($1, $2, $3)`,
+            [
+                'CHECKPOINT_SCANNED',
+                `Scanner checkpoint verified at ${stop.name}: ${scanner.name} (${scannedCount}/${totalCount}) by vehicle ${stop.vehicle_number}.`,
+                stop.vehicle_id
+            ]
+        );
+
+        res.json({
+            message: `✓ Checkpoint ${scanner.name} (${scanner.scanner_code}) scanned and verified successfully!`,
+            scan_record: insertScanRes.rows[0],
+            scanner: scanner,
+            scanned_count: scannedCount,
+            total_scanners: totalCount,
+            progress_text: `${scannedCount}/${totalCount}`,
+            dwell_start_time: dwellStart,
+            elapsed_dwell_seconds: elapsedDwellSec,
+            minimum_collection_time_seconds: minCollectionSec,
+            dwell_completed: isDwellCompleted,
+            all_scanned: allScanned,
+            ready_for_completion: readyForCompletion,
+            is_completed: readyForCompletion,
+            checkpoints: checkpoints
+        });
+
+    } catch (error) {
+        console.error("Scan checkpoint error:", error);
+        res.status(500).json({ message: "Failed to verify checkpoint scanner." });
+    }
+});
+
+// ----------------------------------------------------
+// POST /api/routes/stops/:stopId/complete
+// Complete collection zone with strict GPS geofence, scanner count, and minimum dwell time enforcement
+// ----------------------------------------------------
+router.post("/stops/:stopId/complete", async (req, res) => {
+    try {
+        const { stopId } = req.params;
+        const { latitude, longitude, accuracy, driver_id } = req.body;
+
+        if (latitude === undefined || longitude === undefined || isNaN(Number(latitude)) || isNaN(Number(longitude))) {
+            return res.status(400).json({
+                message: "Current GPS location (latitude and longitude) is required."
+            });
+        }
+
+        if (accuracy !== undefined && accuracy !== null && Number(accuracy) > 100) {
+            return res.status(400).json({
+                message: "GPS accuracy is too low. Please wait for a better GPS signal.",
+                accuracy: Number(accuracy)
+            });
+        }
+
+        const stopResult = await pool.query(
+            `SELECT
+                rs.id,
+                rs.status,
+                rs.route_id,
+                rs.dwell_start_time,
+                rs.scanned_count,
+                rs.verification_status,
+                cp.id AS collection_point_id,
+                cp.name,
+                cp.latitude,
+                cp.longitude,
+                COALESCE(cp.minimum_collection_time_seconds, 30) AS minimum_collection_time_seconds,
+                COALESCE(cp.total_scanners, 3) AS total_scanners,
+                COALESCE(cp.geofence_radius_meters, 100) AS geofence_radius_meters,
+                r.vehicle_id,
+                v.vehicle_number,
+                v.driver_id
+             FROM route_stops rs
+             JOIN collection_points cp ON rs.collection_point_id = cp.id
+             JOIN routes r ON rs.route_id = r.id
+             JOIN vehicles v ON r.vehicle_id = v.id
+             WHERE rs.id = $1`,
+            [stopId]
+        );
+
+        if (stopResult.rows.length === 0) {
+            return res.status(404).json({ message: "Route stop not found." });
+        }
+
+        const stop = stopResult.rows[0];
+
         if (stop.status === "COMPLETED") {
             return res.status(400).json({
                 message: `Collection at ${stop.name} has already been completed.`
             });
         }
 
-        // Verify driver belongs to this vehicle if driver_id provided
         if (driver_id && stop.driver_id && stop.driver_id.toString() !== driver_id.toString()) {
             return res.status(403).json({
                 message: "You are not authorized to complete a stop assigned to another driver's vehicle."
             });
         }
 
+        // 1. GPS Geofence Check
         const driverLat = Number(latitude);
         const driverLon = Number(longitude);
         const pointLat = Number(stop.latitude);
         const pointLon = Number(stop.longitude);
 
-        // Haversine distance in meters
-        const R = 6371000;
-        const lat1 = driverLat * Math.PI / 180;
-        const lat2 = pointLat * Math.PI / 180;
-        const deltaLat = (pointLat - driverLat) * Math.PI / 180;
-        const deltaLon = (pointLon - driverLon) * Math.PI / 180;
+        const { calculateHaversineDistance } = require("../services/trafficService");
+        const distKm = calculateHaversineDistance(driverLat, driverLon, pointLat, pointLon);
+        const distance = Math.round(distKm * 1000);
+        const maxDistance = stop.geofence_radius_meters || 100;
 
-        const a = Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
-                  Math.cos(lat1) * Math.cos(lat2) *
-                  Math.sin(deltaLon / 2) * Math.sin(deltaLon / 2);
-
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        const distance = R * c;
-
-        const MAX_DISTANCE = 100; // 100 meters geofence
-
-        if (distance > MAX_DISTANCE) {
+        if (distance > maxDistance) {
             return res.status(400).json({
-                message: `Vehicle is too far from the collection point. You are ${Math.round(distance)} meters away from ${stop.name}. You must be within ${MAX_DISTANCE} meters to mark this location as collected.`,
-                distance: Math.round(distance),
-                required_distance: MAX_DISTANCE
+                message: `Vehicle is too far from the collection zone. You are ${distance}m away from ${stop.name}. You must remain within ${maxDistance}m to complete collection.`,
+                distance_meters: distance,
+                required_distance: maxDistance
             });
         }
 
+        // 2. Check All Required Scanner Checkpoints
+        const totalCheckpointsRes = await pool.query(
+            `SELECT COUNT(*) FROM scanner_checkpoints WHERE collection_point_id = $1`,
+            [stop.collection_point_id]
+        );
+        const totalCheckpoints = Number(totalCheckpointsRes.rows[0].count) || stop.total_scanners || 3;
+
+        const verifiedScansRes = await pool.query(
+            `SELECT COUNT(DISTINCT scanner_id) FROM scanner_scan_records 
+             WHERE route_stop_id = $1 AND verification_status = 'VERIFIED'`,
+            [stop.id]
+        );
+        const verifiedScans = Number(verifiedScansRes.rows[0].count);
+
+        if (verifiedScans < totalCheckpoints) {
+            return res.status(400).json({
+                message: `Cannot complete collection zone. Only ${verifiedScans} of ${totalCheckpoints} checkpoints have been scanned. All ${totalCheckpoints} scanner checkpoints must be verified.`,
+                scanned_count: verifiedScans,
+                total_scanners: totalCheckpoints,
+                remaining: totalCheckpoints - verifiedScans
+            });
+        }
+
+        // 3. Check Minimum Dwell / Collection Duration
+        const minDwellSeconds = Number(stop.minimum_collection_time_seconds) || 30;
+
+        if (!stop.dwell_start_time) {
+            return res.status(400).json({
+                message: `Collection timer has not started or was reset because the vehicle left the zone. You must remain in ${stop.name} for at least ${minDwellSeconds} seconds.`,
+                minimum_collection_time_seconds: minDwellSeconds
+            });
+        }
+
+        const elapsedSeconds = Math.floor((Date.now() - new Date(stop.dwell_start_time).getTime()) / 1000);
+
+        if (elapsedSeconds < minDwellSeconds) {
+            const remainingSeconds = minDwellSeconds - elapsedSeconds;
+            return res.status(400).json({
+                message: `Vehicle must remain in the collection zone for at least ${minDwellSeconds} seconds. Current dwell time: ${elapsedSeconds} seconds. Please wait ${remainingSeconds} more second${remainingSeconds !== 1 ? 's' : ''}.`,
+                elapsed_seconds: elapsedSeconds,
+                minimum_collection_time_seconds: minDwellSeconds,
+                remaining_seconds: remainingSeconds
+            });
+        }
+
+        // 4. Update route_stop to COMPLETED
         const result = await pool.query(
             `UPDATE route_stops
              SET
                 status = 'COMPLETED',
-                actual_arrival = COALESCE(actual_arrival, CURRENT_TIMESTAMP),
+                verification_status = 'COMPLETED',
+                actual_arrival = COALESCE(actual_arrival, dwell_start_time, CURRENT_TIMESTAMP),
                 actual_departure = CURRENT_TIMESTAMP
              WHERE id = $1
              RETURNING *`,
@@ -561,20 +1055,103 @@ router.post("/stops/:stopId/complete", async (req, res) => {
              VALUES ($1, $2, $3)`,
             [
                 'COLLECTION_COMPLETED',
-                `Collection completed at ${stop.name} by vehicle ${stop.vehicle_number} (${Math.round(distance)}m within geofence).`,
+                `Collection zone ${stop.name} fully verified (${verifiedScans}/${totalCheckpoints} scanners, ${elapsedSeconds}s dwell time) by vehicle ${stop.vehicle_number}.`,
                 stop.vehicle_id
             ]
         );
 
         res.json({
-            message: `Collection at ${stop.name} verified successfully.`,
-            distance: Math.round(distance),
+            message: `✓ Collection zone ${stop.name} verified and completed successfully! (${verifiedScans}/${totalCheckpoints} checkpoints, ${elapsedSeconds}s dwell time)`,
+            distance_meters: distance,
+            dwell_seconds: elapsedSeconds,
+            scanned_count: verifiedScans,
+            total_scanners: totalCheckpoints,
             stop: result.rows[0]
         });
 
     } catch (error) {
         console.error("Complete stop error:", error);
-        res.status(500).json({ message: "Failed to verify collection point." });
+        res.status(500).json({ message: "Failed to complete collection zone." });
+    }
+});
+
+// ----------------------------------------------------
+// GET /api/routes/stops/:stopId/checkpoints
+// Get checkpoints and scan history for a collection stop
+// ----------------------------------------------------
+router.get("/stops/:stopId/checkpoints", async (req, res) => {
+    try {
+        const { stopId } = req.params;
+
+        const stopRes = await pool.query(
+            `SELECT rs.id, rs.collection_point_id, rs.dwell_start_time, rs.status, rs.verification_status,
+                    cp.name, cp.ward, cp.minimum_collection_time_seconds, cp.total_scanners, cp.geofence_radius_meters
+             FROM route_stops rs
+             JOIN collection_points cp ON rs.collection_point_id = cp.id
+             WHERE rs.id = $1`,
+            [stopId]
+        );
+
+        if (stopRes.rows.length === 0) {
+            return res.status(404).json({ message: "Route stop not found." });
+        }
+
+        const stop = stopRes.rows[0];
+
+        const checkpointsRes = await pool.query(
+            `SELECT 
+                sc.id,
+                sc.scanner_code,
+                sc.name,
+                sc.sequence,
+                sc.latitude,
+                sc.longitude,
+                sc.status,
+                sr.id AS scan_record_id,
+                sr.scanned_at,
+                sr.verification_status,
+                CASE WHEN sr.id IS NOT NULL AND sr.verification_status = 'VERIFIED' THEN TRUE ELSE FALSE END AS is_scanned
+             FROM scanner_checkpoints sc
+             LEFT JOIN scanner_scan_records sr 
+               ON sc.id = sr.scanner_id 
+              AND sr.route_stop_id = $1 
+              AND sr.verification_status = 'VERIFIED'
+             WHERE sc.collection_point_id = $2
+             ORDER BY sc.sequence ASC`,
+            [stop.id, stop.collection_point_id]
+        );
+
+        const checkpoints = checkpointsRes.rows;
+        const total = checkpoints.length || stop.total_scanners || 3;
+        const scanned = checkpoints.filter(c => c.is_scanned).length;
+
+        const minCollectionSec = Number(stop.minimum_collection_time_seconds) || 30;
+        let elapsedDwellSec = 0;
+        if (stop.dwell_start_time) {
+            elapsedDwellSec = Math.max(0, Math.floor((Date.now() - new Date(stop.dwell_start_time).getTime()) / 1000));
+        }
+
+        res.json({
+            stop_id: stop.id,
+            zone_name: stop.name,
+            ward: stop.ward,
+            status: stop.status,
+            verification_status: stop.verification_status,
+            dwell_start_time: stop.dwell_start_time,
+            elapsed_dwell_seconds: elapsedDwellSec,
+            minimum_collection_time_seconds: minCollectionSec,
+            dwell_completed: elapsedDwellSec >= minCollectionSec,
+            scanned_count: scanned,
+            total_scanners: total,
+            progress_text: `${scanned}/${total}`,
+            all_scanned: scanned >= total,
+            ready_for_completion: scanned >= total && elapsedDwellSec >= minCollectionSec,
+            checkpoints: checkpoints
+        });
+
+    } catch (error) {
+        console.error("Fetch checkpoints error:", error);
+        res.status(500).json({ message: "Failed to fetch stop checkpoints." });
     }
 });
 

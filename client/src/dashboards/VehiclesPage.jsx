@@ -7,7 +7,8 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
     const [searchTerm, setSearchTerm] = useState("");
     const [showAddModal, setShowAddModal] = useState(false);
     const [newVehicleNumber, setNewVehicleNumber] = useState("");
-    const [newStatus, setNewStatus] = useState("AVAILABLE");
+    const [newStatus, setNewStatus] = useState("IN_SERVICE");
+    const [newWard, setNewWard] = useState("Ward 12");
 
     // Operation Date state synchronized with Authority Dashboard
     const [localSelectedDate, setLocalSelectedDate] = useState(() => {
@@ -27,6 +28,10 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
     const [selectedVehicleDetails, setSelectedVehicleDetails] = useState(null);
     const [detailsLoading, setDetailsLoading] = useState(false);
     const [detailsTab, setDetailsTab] = useState("ALL"); // ALL, COMPLETED, PENDING, MISSED
+
+    // Editing permanent ward state
+    const [editingWard, setEditingWard] = useState(false);
+    const [newPermanentWard, setNewPermanentWard] = useState("");
 
     const fetchVehicles = async (dateToUse = selectedDate) => {
         try {
@@ -64,7 +69,7 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
         }
     }, [initialVehicleId, selectedDate]);
 
-    // Live auto-refresh when vehicle details modal is open so newly assigned points reflect instantly
+    // Live auto-refresh when vehicle details modal is open
     useEffect(() => {
         const vehicleId = selectedVehicleDetails?.vehicle?.vehicle_id || selectedVehicleDetails?.vehicle?.id;
         if (!vehicleId) return;
@@ -78,7 +83,7 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
             }
         };
 
-        const interval = setInterval(refreshDetailsSilently, 3000);
+        const interval = setInterval(refreshDetailsSilently, 4000);
         window.addEventListener("vehicle_assignment_updated", refreshDetailsSilently);
 
         return () => {
@@ -92,8 +97,9 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
         const q = searchTerm.toLowerCase();
         const vNum = (v.vehicle_number || "").toLowerCase();
         const dName = (v.driver_name || "").toLowerCase();
+        const ward = (v.permanent_ward || "").toLowerCase();
         const vId = `v0${v.id}`.toLowerCase();
-        return vNum.includes(q) || dName.includes(q) || vId.includes(q);
+        return vNum.includes(q) || dName.includes(q) || ward.includes(q) || vId.includes(q);
     });
 
     const handleAddVehicle = async (e) => {
@@ -101,7 +107,8 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
         try {
             await api.post("/vehicles", {
                 vehicle_number: newVehicleNumber,
-                status: newStatus
+                status: newStatus,
+                ward: newWard
             });
             setShowAddModal(false);
             setNewVehicleNumber("");
@@ -114,9 +121,11 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
     const handleViewDetails = async (vehicleId, dateToUse = selectedDate) => {
         setDetailsLoading(true);
         setDetailsTab("ALL");
+        setEditingWard(false);
         try {
             const response = await api.get(`/vehicles/${vehicleId}/details?date=${dateToUse}`);
             setSelectedVehicleDetails(response.data);
+            setNewPermanentWard(response.data.permanent_ward || "Ward 12");
         } catch (error) {
             console.error("Fetch vehicle details error:", error);
             alert("Failed to load vehicle details.");
@@ -125,15 +134,30 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
         }
     };
 
-    const handleStatusChange = async (vehicleId, newStatus) => {
+    const handleStatusChange = async (vehicleId, updatedStatus) => {
         try {
-            const res = await api.put(`/vehicles/${vehicleId}`, { status: newStatus });
+            const res = await api.put(`/vehicles/${vehicleId}`, { status: updatedStatus });
             if (res.data.requires_reassignment) {
-                alert(`⚠️ ${res.data.message}\n\nPlease navigate to "Assign Vehicle" to reassign its collection points to an active vehicle.`);
+                alert(`⚠️ ${res.data.message}\n\nPlease navigate to the Dashboard to assign a replacement vehicle.`);
             }
             fetchVehicles(selectedDate);
+            if (selectedVehicleDetails && (selectedVehicleDetails.vehicle?.id === vehicleId || selectedVehicleDetails.vehicle?.vehicle_id === vehicleId)) {
+                handleViewDetails(vehicleId, selectedDate);
+            }
         } catch (error) {
             alert(error.response?.data?.message || "Failed to update vehicle status");
+        }
+    };
+
+    const handleSavePermanentWard = async (vehicleId) => {
+        try {
+            const res = await api.post(`/vehicles/${vehicleId}/permanent-area`, { ward: newPermanentWard });
+            alert(res.data.message || "Permanent area updated successfully.");
+            setEditingWard(false);
+            handleViewDetails(vehicleId, selectedDate);
+            fetchVehicles(selectedDate);
+        } catch (error) {
+            alert(error.response?.data?.message || "Failed to update permanent area");
         }
     };
 
@@ -159,7 +183,7 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "24px" }}>
                 <div>
                     <h1 style={{ fontSize: "24px", fontWeight: "700", color: "#0f172a", margin: 0 }}>Vehicles</h1>
-                    <p style={{ fontSize: "14px", color: "#64748b", margin: "4px 0 0 0" }}>Manage fleet vehicles, status, and driver assignments</p>
+                    <p style={{ fontSize: "14px", color: "#64748b", margin: "4px 0 0 0" }}>Manage fleet vehicles, permanent area assignments, and driver statuses</p>
                 </div>
                 <button
                     onClick={() => setShowAddModal(true)}
@@ -184,11 +208,11 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
             <div style={{ backgroundColor: "#ffffff", padding: "16px", borderRadius: "10px", marginBottom: "20px", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>
                 <input
                     type="text"
-                    placeholder="Search by vehicle number or driver..."
+                    placeholder="Search by vehicle number, driver, or ward..."
                     value={searchTerm}
                     onChange={(e) => setSearchTerm(e.target.value)}
                     style={{
-                        width: "320px",
+                        width: "340px",
                         padding: "8px 14px",
                         borderRadius: "6px",
                         border: "1px solid #cbd5e1",
@@ -221,6 +245,7 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                             <th style={{ padding: "14px 20px" }}>ID</th>
                             <th style={{ padding: "14px 20px" }}>Vehicle Number</th>
                             <th style={{ padding: "14px 20px" }}>Driver Name</th>
+                            <th style={{ padding: "14px 20px" }}>Permanent Area</th>
                             <th style={{ padding: "14px 20px" }}>Status</th>
                             <th style={{ padding: "14px 20px" }}>Stops Completed</th>
                             <th style={{ padding: "14px 20px", textAlign: "right" }}>Actions</th>
@@ -228,9 +253,9 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                     </thead>
                     <tbody>
                         {loading ? (
-                            <tr><td colSpan="6" style={{ padding: "20px", textAlign: "center" }}>Loading vehicles...</td></tr>
+                            <tr><td colSpan="7" style={{ padding: "20px", textAlign: "center" }}>Loading vehicles...</td></tr>
                         ) : filteredVehicles.length === 0 ? (
-                            <tr><td colSpan="6" style={{ padding: "20px", textAlign: "center", color: "#64748b" }}>No vehicles found</td></tr>
+                            <tr><td colSpan="7" style={{ padding: "20px", textAlign: "center", color: "#64748b" }}>No vehicles found</td></tr>
                         ) : (
                             filteredVehicles.map((v) => {
                                 const badge = getStatusStyle(v.status);
@@ -239,6 +264,16 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                                         <td style={{ padding: "14px 20px", fontWeight: "600", color: "#334155" }}>V0{v.id}</td>
                                         <td style={{ padding: "14px 20px", fontWeight: "700", color: "#047857" }}>{v.vehicle_number}</td>
                                         <td style={{ padding: "14px 20px", color: "#334155" }}>{v.driver_name || "Unassigned"}</td>
+                                        <td style={{ padding: "14px 20px" }}>
+                                            <span style={{ fontWeight: "700", color: "#0369a1" }}>
+                                                {v.permanent_ward || "Unassigned"}
+                                            </span>
+                                            {v.temporary_ward && (
+                                                <div style={{ fontSize: "11px", color: "#d97706", fontWeight: "700", marginTop: "2px" }}>
+                                                    ⚡ Temp: {v.temporary_ward}
+                                                </div>
+                                            )}
+                                        </td>
                                         <td style={{ padding: "14px 20px" }}>
                                             <select
                                                 value={v.status || "AVAILABLE"}
@@ -300,11 +335,11 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                     justifyContent: "center",
                     zIndex: 1000
                 }}>
-                    <div style={{ backgroundColor: "white", padding: "28px", borderRadius: "12px", width: "400px" }}>
+                    <div style={{ backgroundColor: "white", padding: "28px", borderRadius: "12px", width: "420px" }}>
                         <h3 style={{ marginTop: 0, color: "#0f172a" }}>Add New Vehicle</h3>
                         <form onSubmit={handleAddVehicle}>
                             <div style={{ marginBottom: "16px" }}>
-                                <label style={{ display: "block", fontSize: "14px", fontWeight: "500", marginBottom: "6px" }}>Vehicle Number</label>
+                                <label style={{ display: "block", fontSize: "14px", fontWeight: "600", marginBottom: "6px" }}>Vehicle Number</label>
                                 <input
                                     type="text"
                                     placeholder="e.g. KA06KL2345"
@@ -314,15 +349,29 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                                     style={{ width: "100%", padding: "8px 12px", borderRadius: "6px", border: "1px solid #cbd5e1" }}
                                 />
                             </div>
+                            <div style={{ marginBottom: "16px" }}>
+                                <label style={{ display: "block", fontSize: "14px", fontWeight: "600", marginBottom: "6px" }}>Permanent Service Area / Ward</label>
+                                <select
+                                    value={newWard}
+                                    onChange={(e) => setNewWard(e.target.value)}
+                                    style={{ width: "100%", padding: "8px 12px", borderRadius: "6px", border: "1px solid #cbd5e1" }}
+                                >
+                                    <option value="Ward 12">Ward 12 (Central)</option>
+                                    <option value="Ward 13">Ward 13 (Jayanagar)</option>
+                                    <option value="Ward 14">Ward 14 (Malleshwaram)</option>
+                                    <option value="Ward 15">Ward 15 (Whitefield)</option>
+                                    <option value="Ward 16">Ward 16 (Indiranagar)</option>
+                                </select>
+                            </div>
                             <div style={{ marginBottom: "20px" }}>
-                                <label style={{ display: "block", fontSize: "14px", fontWeight: "500", marginBottom: "6px" }}>Initial Status</label>
+                                <label style={{ display: "block", fontSize: "14px", fontWeight: "600", marginBottom: "6px" }}>Initial Status</label>
                                 <select
                                     value={newStatus}
                                     onChange={(e) => setNewStatus(e.target.value)}
                                     style={{ width: "100%", padding: "8px 12px", borderRadius: "6px", border: "1px solid #cbd5e1" }}
                                 >
-                                    <option value="AVAILABLE">Available</option>
                                     <option value="IN_SERVICE">In Service</option>
+                                    <option value="AVAILABLE">Available</option>
                                     <option value="MAINTENANCE">Maintenance</option>
                                 </select>
                             </div>
@@ -350,28 +399,28 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                         backgroundColor: "white",
                         padding: "28px",
                         borderRadius: "14px",
-                        width: "720px",
-                        maxWidth: "92%",
-                        maxHeight: "88vh",
+                        width: "740px",
+                        maxWidth: "94%",
+                        maxHeight: "90vh",
                         overflowY: "auto"
                     }}>
                         {/* Modal Header */}
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "20px", borderBottom: "1px solid #e2e8f0", paddingBottom: "16px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "16px", borderBottom: "1px solid #e2e8f0", paddingBottom: "16px" }}>
                             <div>
                                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                                     <h2 style={{ margin: 0, color: "#047857", fontSize: "22px", fontWeight: "800" }}>
                                         🚛 {selectedVehicleDetails.vehicle?.vehicle_number}
                                     </h2>
                                     <span style={{
-                                        backgroundColor: (selectedVehicleDetails.vehicle?.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#fee2e2" : "#ecfdf5",
-                                        color: (selectedVehicleDetails.vehicle?.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#b91c1c" : "#047857",
+                                        backgroundColor: (selectedVehicleDetails.vehicle?.vehicle_status || selectedVehicleDetails.vehicle?.status || "").toUpperCase() === "MAINTENANCE" ? "#fee2e2" : "#ecfdf5",
+                                        color: (selectedVehicleDetails.vehicle?.vehicle_status || selectedVehicleDetails.vehicle?.status || "").toUpperCase() === "MAINTENANCE" ? "#b91c1c" : "#047857",
                                         padding: "3px 10px",
                                         borderRadius: "12px",
                                         fontSize: "12px",
                                         fontWeight: "700",
-                                        border: `1px solid ${(selectedVehicleDetails.vehicle?.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "#fca5a5" : "#a7f3d0"}`
+                                        border: `1px solid ${(selectedVehicleDetails.vehicle?.vehicle_status || selectedVehicleDetails.vehicle?.status || "").toUpperCase() === "MAINTENANCE" ? "#fca5a5" : "#a7f3d0"}`
                                     }}>
-                                        {(selectedVehicleDetails.vehicle?.vehicle_status || "").toUpperCase() === "MAINTENANCE" ? "🔧 MAINTENANCE" : "🟢 IN SERVICE"}
+                                        {(selectedVehicleDetails.vehicle?.vehicle_status || selectedVehicleDetails.vehicle?.status || "").toUpperCase() === "MAINTENANCE" ? "🔧 MAINTENANCE" : "🟢 IN SERVICE"}
                                     </span>
                                 </div>
                                 <p style={{ margin: "4px 0 0 0", color: "#64748b", fontSize: "14px" }}>
@@ -387,6 +436,88 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                             >
                                 ✕
                             </button>
+                        </div>
+
+                        {/* PERMANENT & TEMPORARY ASSIGNMENT CARD */}
+                        <div style={{ backgroundColor: "#f0fdf4", padding: "16px 20px", borderRadius: "10px", border: "1px solid #bbf7d0", marginBottom: "16px" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                <div>
+                                    <div style={{ fontSize: "11px", fontWeight: "700", color: "#166534", textTransform: "uppercase" }}>
+                                        📍 Permanent Service Area
+                                    </div>
+                                    <div style={{ fontSize: "18px", fontWeight: "800", color: "#047857", marginTop: "2px" }}>
+                                        {selectedVehicleDetails.permanent_ward || "Unassigned"}
+                                    </div>
+                                    <div style={{ fontSize: "12px", color: "#475569", marginTop: "2px" }}>
+                                        {selectedVehicleDetails.permanent_collection_points?.length || 0} Regular Collection Points
+                                    </div>
+                                </div>
+
+                                {!editingWard ? (
+                                    <button
+                                        onClick={() => setEditingWard(true)}
+                                        style={{
+                                            backgroundColor: "#ffffff",
+                                            border: "1px solid #cbd5e1",
+                                            color: "#047857",
+                                            padding: "6px 12px",
+                                            borderRadius: "6px",
+                                            fontSize: "12px",
+                                            fontWeight: "600",
+                                            cursor: "pointer"
+                                        }}
+                                    >
+                                        Edit Area
+                                    </button>
+                                ) : (
+                                    <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                        <select
+                                            value={newPermanentWard}
+                                            onChange={(e) => setNewPermanentWard(e.target.value)}
+                                            style={{ padding: "6px 10px", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "12px" }}
+                                        >
+                                            <option value="Ward 12">Ward 12</option>
+                                            <option value="Ward 13">Ward 13</option>
+                                            <option value="Ward 14">Ward 14</option>
+                                            <option value="Ward 15">Ward 15</option>
+                                            <option value="Ward 16">Ward 16</option>
+                                        </select>
+                                        <button
+                                            onClick={() => handleSavePermanentWard(selectedVehicleDetails.vehicle.id || selectedVehicleDetails.vehicle.vehicle_id)}
+                                            style={{ backgroundColor: "#047857", color: "white", border: "none", padding: "6px 12px", borderRadius: "6px", fontSize: "12px", fontWeight: "700", cursor: "pointer" }}
+                                        >
+                                            Save
+                                        </button>
+                                        <button
+                                            onClick={() => setEditingWard(false)}
+                                            style={{ backgroundColor: "#f1f5f9", color: "#64748b", border: "none", padding: "6px 10px", borderRadius: "6px", fontSize: "12px", cursor: "pointer" }}
+                                        >
+                                            Cancel
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Temporary Replacement Information If Applicable */}
+                            {selectedVehicleDetails.is_covering && (
+                                <div style={{ marginTop: "10px", paddingTop: "10px", borderTop: "1px solid #bbf7d0", fontSize: "13px", color: "#b45309", fontWeight: "700" }}>
+                                    ⚡ <strong>Temporary Assignment:</strong> Covering <strong>{selectedVehicleDetails.temporary_assignment?.ward}</strong> today for vehicle <strong>{selectedVehicleDetails.temporary_assignment?.original_vehicle_number}</strong>.
+                                </div>
+                            )}
+
+                            {selectedVehicleDetails.vehicle?.is_maintenance && (
+                                <div style={{ marginTop: "10px", paddingTop: "10px", borderTop: "1px solid #fca5a5", fontSize: "13px" }}>
+                                    {selectedVehicleDetails.replacement_coverage ? (
+                                        <span style={{ color: "#15803d", fontWeight: "700" }}>
+                                            ✓ <strong>Replacement Assigned:</strong> Vehicle <strong>{selectedVehicleDetails.replacement_coverage.replacement_vehicle_number}</strong> is temporarily servicing {selectedVehicleDetails.permanent_ward}.
+                                        </span>
+                                    ) : (
+                                        <span style={{ color: "#b91c1c", fontWeight: "700" }}>
+                                            ⚠️ <strong>Today's Collection:</strong> NOT AVAILABLE (Pending Authority Replacement Assignment).
+                                        </span>
+                                    )}
+                                </div>
+                            )}
                         </div>
 
                         {/* Summary Badges Bar */}
@@ -468,7 +599,7 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                         <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
                             {selectedVehicleDetails.all_stops.length === 0 ? (
                                 <p style={{ fontSize: "14px", color: "#64748b", textAlign: "center", padding: "20px" }}>
-                                    No collection areas assigned to this vehicle for today.
+                                    No collection areas scheduled for this vehicle today.
                                 </p>
                             ) : (
                                 selectedVehicleDetails.all_stops
@@ -511,7 +642,6 @@ function VehiclesPage({ initialVehicleId, onClearInitialVehicle, selectedDate: p
                                                         📍 {stop.address}
                                                     </div>
 
-                                                    {/* Additional Info depending on status */}
                                                     {isCompleted && (
                                                         <div style={{ fontSize: "12px", color: "#15803d", marginTop: "4px", fontWeight: "600" }}>
                                                             ✓ Collected at: {stop.actual_arrival ? new Date(stop.actual_arrival).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "Completed"}
